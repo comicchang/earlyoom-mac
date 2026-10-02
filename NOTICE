@@ -1,0 +1,11 @@
+# Notices
+
+`earlyoom-mac` is an independent clean-room implementation. The design is informed by the public behavior and documentation of:
+
+- [rfjakob/earlyoom](https://github.com/rfjakob/earlyoom), MIT;
+- [caproom](https://github.com/intelogroup/caproom), MIT;
+- [RAMWatcher](https://github.com/ganoliya/RAMWatcher), MIT;
+- [macOS footprint watchdog](https://github.com/curlewlabs-com/macos-footprint-watchdog), MIT;
+- [mac-memory-guard](https://github.com/TomGranot/mac-memory-guard), MIT.
+
+No source files from those projects are included. See [`docs/RESEARCH.md`](docs/RESEARCH.md) for scope and licensing decisions.
