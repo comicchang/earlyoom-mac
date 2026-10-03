@@ -99,11 +99,11 @@ A GUI app is identified by the executable's containing `.app` bundle and a non-e
 | `protect_current_session` | Protect every process in the daemon's current login session. | `true` |
 | `protect_ancestors` | Protect the daemon's ancestor/descendant chain. | `true` |
 | `protect_process_groups` | Protect any process group containing an intrinsically protected member. | `true` |
-| `names` | Additional exact process names to suppress, case-insensitively. | macOS safety/session names in the sample |
+| `names` | Additional exact process names to suppress, case-insensitively. | the full mandatory macOS safety/session baseline (see below) |
 | `bundle_ids` | Additional exact `CFBundleIdentifier` values to suppress. | empty |
 | `extra_uids` | Additional numeric UIDs to suppress. | empty |
 
-The mandatory baseline is always unioned with `names`, even if a local file omits it. It includes `launchd`/PID 1, `kernel_task`, `WindowServer`, `loginwindow`, `mDNSResponder`, `securityd`, `syspolicyd`, `coreaudiod`, `sshd`, `sshd-session`, common terminal emulators, `tmux`, and `screen`. These targets are protected because terminating them can break the OS, the graphical login, networking/security/audio, or the user's current SSH/terminal work. Current UID/session protection is also enabled by default, so a newly started instance reports but does not target the operator's work.
+The mandatory baseline is always unioned with `names`, even if a local file omits it. It includes `launchd`/PID 1, `kernel_task`, `WindowServer`, `loginwindow`, `mDNSResponder`, `securityd`, `syspolicyd`, `coreaudiod`, `sshd`, `sshd-session`, common terminal emulators (`Terminal`, `iTerm2`, `Alacritty`, `kitty`, `WezTerm`, `Ghostty`), `tmux`, `screen`, and the additional desktop/session infrastructure names `notifyd`, `opendirectoryd`, `configd`, `runningboardd`, `distnoted`. These targets are protected because terminating them can break the OS, the graphical login, networking/security/audio, or the user's current SSH/terminal work. [`docs/DESIGN.md`](docs/DESIGN.md) gives the reason for each name. Current UID/session protection is also enabled by default, so a newly started instance reports but does not target the operator's work.
 
 ## How to deliberately enable enforcement (do not do this blindly)
 
@@ -159,6 +159,21 @@ Every plan is produced after suppression and identity checks. The executor rejec
 - Inactive/purgeable memory is treated as reclaimable; compressed memory is not. This is an explicit policy approximation and can differ from a future macOS pressure implementation.
 - No caches are purged and no swap settings are changed.
 
+### Known gaps in this release
+
+These are real, currently unfixed limitations. They are listed here so a reader cannot
+mistake the feature list above for coverage that does not exist. Each one states the
+configuration that causes it, because in every case the default configuration is on the
+safe-but-limited side.
+
+1. **The defaults protect the very processes you probably want gone.** `protect_current_user = true` (the default) suppresses *every* process owned by the daemon's UID, not just the daemon's own tree. The runaway workload that motivates a memory-pressure watchdog — an agent kernel, a browser, a VM, a build — normally runs as that same user, so under the shipped configuration it is reported and never acted on. Reaching it requires setting `protect_current_user = false`, which also disarms the guard that keeps the watchdog from targeting the operator's own session. This is a deliberate trade: the safe default cannot distinguish "my important work" from "my runaway work", so it protects both.
+2. **GUI applications can never be acted on under the default policy.** `gui_escalation = never` (the default) maps every verified app bundle to `reportOnly` in `CandidatePlanner.actionSafety`, so even with both enable gates set to their enforcement values, a macOS `.app` is reported and left running. The escalation ladder (`graceful_then_force`, `force_application`, `process_group`) exists and is tested at the planning level, but it is inert until an operator opts in — and each rung is destructive in a different way, which is exactly why none of them is the default.
+3. **A workload with more than one process is refused entirely, not handled piecemeal.** When `allow_process_group = false` (the default) and a candidate group contains more than one member, the planner returns `reportOnly` for the *whole group* rather than terminating one member. It does **not** fall back to per-process termination of the largest member. The practical consequence is asymmetric and worth stating plainly: a genuinely single-process hog — one VM process, one compiler process, one runaway daemon — remains eligible under the default settings, while a multi-process workload (a browser plus its helpers, a worker pool, a build system fanning out) is never eligible no matter how large it grows, until `allow_process_group = true` is set. Members are grouped *after* the `minimum_candidate` filter, so a workload whose helpers each sit below `64MiB` can still collapse into a single-member group and stay eligible — it is the number of members above that threshold, not the raw process count, that decides. See [`docs/DESIGN.md`](docs/DESIGN.md) for why picking a representative was rejected rather than merely deprioritized.
+4. **The code that actually sends signals has no test coverage.** `DarwinActionExecutor` — the `SIGTERM`/`SIGKILL` delivery, the `NSRunningApplication` graceful-then-force path, the process-group gate, and the PID-reuse re-verification — is excluded from the test target. The planner, the parser, the suppression policy, and the daemon seam are covered; the executor is not. Every safety claim about *which* action is selected is therefore regression-tested, while every claim about *how* it is delivered is currently argued rather than tested. See the mutation evidence in [`docs/DECISIONS.md`](docs/DECISIONS.md).
+5. **Test discrimination is good on selection logic and absent on delivery logic.** Spot mutation checks confirm the suite fails when ranking is switched from `phys_footprint` to RSS, and when the mandatory suppression names stop being unioned. The same checks show that disabling the executor's PID-reuse guard entirely leaves the suite green. The suite is a real guardrail for *policy*, and not one for *mechanics*.
+
+None of these are hidden behind configuration: in every case the tool prints the reason it declined to act (`action=reportOnly` / `action=protectedTarget` plus a `reason=` string) rather than staying silent.
+
 See [`docs/DESIGN.md`](docs/DESIGN.md) for architecture, safety boundaries, GUI identity details, and known limitations.
 
 ## Testing
@@ -173,6 +188,15 @@ The test target covers:
 - a regression where a process has **19.84 GiB footprint and 7.8 MiB RSS**—ranking by RSS would select the wrong victim;
 - a daemon smoke seam proving report-only mode calls no action executor.
 
+It deliberately does **not** cover:
+
+- exact pressure-level boundaries (`available` *exactly equal to* a threshold, rather than just below it);
+- anything inside `DarwinActionExecutor`.
+
+Those two are gaps, not coverage. The suite is a guardrail for **policy** — what gets
+selected — and not for **mechanics** — how a signal is delivered. Mutation evidence for
+both claims is recorded in [`docs/DECISIONS.md`](docs/DECISIONS.md).
+
 Run:
 
 ```sh
@@ -186,3 +210,11 @@ Prior-art conclusions and links are in [`docs/RESEARCH.md`](docs/RESEARCH.md). E
 ## Contributing, security, and conduct
 
 Please read [`CONTRIBUTING.md`](CONTRIBUTING.md), [`SECURITY.md`](SECURITY.md), [`NOTICE`](NOTICE), and [`CODE_OF_CONDUCT.md`](CODE_OF_CONDUCT.md). Safety changes require tests that prove both the intended action and the no-action boundary.
+
+## Documentation
+
+| Document | What it answers |
+| --- | --- |
+| [`docs/DESIGN.md`](docs/DESIGN.md) | How the daemon is structured, the full GUI decision table, the suppression rationale, and the complete list of known limitations. |
+| [`docs/RESEARCH.md`](docs/RESEARCH.md) | Which prior art was evaluated, what its license and data sources were, and why this is a clean-room implementation rather than a fork. |
+| [`docs/DECISIONS.md`](docs/DECISIONS.md) | Why each major design choice was made, which alternatives were rejected and at what cost, and the verification evidence (config probes, behavioural probes, mutation checks) behind the current claims. |

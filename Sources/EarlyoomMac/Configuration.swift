@@ -109,7 +109,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
     protect_current_session = true
     protect_ancestors = true
     protect_process_groups = true
-    names = launchd,kernel_task,WindowServer,loginwindow,mDNSResponder,securityd,syspolicyd,coreaudiod,sshd,sshd-session,Terminal,iTerm2,Alacritty,kitty,WezTerm,Ghostty,tmux,screen
+    names = launchd,kernel_task,WindowServer,loginwindow,mDNSResponder,securityd,syspolicyd,coreaudiod,sshd,sshd-session,Terminal,iTerm2,Alacritty,kitty,WezTerm,Ghostty,tmux,screen,notifyd,opendirectoryd,configd,runningboardd,distnoted
     bundle_ids =
     extra_uids =
     """

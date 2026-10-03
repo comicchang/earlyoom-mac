@@ -1,5 +1,10 @@
 # Design, trade-offs, and known limitations
 
+This document describes what the system does and why the boundaries sit where they do.
+The record of the options that were weighed and rejected — including the costs each choice
+accepted — is in [`DECISIONS.md`](DECISIONS.md), which also carries the verification
+evidence for the claims made here.
+
 ## Goals and non-goals
 
 The daemon is a pressure-triggered safety valve for a desktop Mac. It samples every process, measures physical ownership, ranks eligible workload units, and reports or performs a deliberately staged action. The default is **report-only** and cannot send a signal.
@@ -120,7 +125,7 @@ The planner emits a plan; only the explicit enforcement mode can execute it.
 | Normal or warning pressure | Report only | No termination is justified. |
 | Candidate is protected by the suppression policy | Never act | This is checked during planning and the executor refuses protected/report-only plans. |
 | Non-GUI singleton, enforcement enabled, `allow_process_group = false` | Send `SIGTERM` to one PID; after `grace_period`, `SIGKILL` only if it is still alive | The smallest unit; used for ordinary single-process CLI/workers. |
-| Non-GUI process group with multiple members and `allow_process_group = false` | Report only | Killing one `.singleProcess` representative would leave the multi-process workload running, so the planner refuses the misleading action. |
+| Non-GUI process group with multiple members and `allow_process_group = false` | Report only | Killing one `.singleProcess` representative would leave the multi-process workload running, so the planner refuses the misleading action. **The refusal covers the whole group**: it does not fall back to terminating the largest member. See the consequence note below. |
 | GUI bundle identified, `gui_escalation = graceful_then_force` | Call `NSRunningApplication.terminate()` for the matching app; after grace, call `forceTerminate()` only for survivors | Gives the app an opportunity to save/close. Matching uses bundle ID and the sampled PID/path, not a display-name substring. |
 | GUI bundle identified, `gui_escalation = force_application` | Call `NSRunningApplication.forceTerminate()` for the verified bundle instance; after grace, KILL only still-live sampled members | Explicitly destructive; disabled by default. |
 | GUI bundle identified, `gui_escalation = process_group` and `allow_process_group = true` | TERM then KILL the PGID only after group safety checks | Highest blast radius; the policy rejects groups containing protected members. |
@@ -128,6 +133,42 @@ The planner emits a plan; only the explicit enforcement mode can execute it.
 | Thread-only termination | **Never implemented** | There is no safe external, public “kill this GUI worker thread” contract. `pthread_kill`/Mach thread actions cannot establish ownership or save state; using them would make the safety claim false. |
 
 The implementation does not use AppleScript or a display-name match for quitting. `NSRunningApplication` is used only after bundle identity resolution, and the force step is a separate explicit policy value.
+
+### Why "refuse the group" instead of "pick its biggest member"
+
+This is a load-bearing trade-off and the consequence is asymmetric enough that it is
+worth stating without euphemism.
+
+The rejected alternative was to treat a multi-member group as several ordinary
+`.singleProcess` candidates and terminate the largest one. It was rejected on the
+grounds that it makes the report **lie**: the plan would read as "this workload was
+handled" while the workload's remaining helpers keep their memory and keep running, and
+the next sampling round would simply re-report the same workload under a different PID.
+For the class of process this tool exists to catch — an agent kernel, a browser, a VM, a
+compiler — the helpers *are* the leak. Cleaning the representative without the group
+converts one clear report into a stream of ambiguous ones.
+
+The cost of refusing is that eligibility now depends on a property of the workload that
+has nothing to do with its size:
+
+- a genuinely single-process hog — one VM process, one compiler process, one runaway
+  daemon — stays eligible under the **default** `allow_process_group = false`;
+- any workload that contributes **two or more members above
+  `minimum_candidate`** to a single group is ineligible under those same
+  defaults, no matter how large its footprint grows, until an operator sets
+  `allow_process_group = true` and accepts process-group blast radius.
+
+  "Members" matters here: `CandidatePlanner` filters out anything below
+  `minimum_candidate` *before* grouping, so a workload whose helpers each sit
+  under `64MiB` collapses into a single-member group and stays eligible. The
+  cliff is therefore in group membership, not in raw process count.
+
+That is a real coverage gap rather than a rounding error, and it is recorded as such in
+[`DECISIONS.md`](DECISIONS.md). The gap was accepted deliberately: the alternative was a
+default that appears to act on memory-hungry workloads but silently fails to relieve
+them, which is the worse failure for a tool whose entire premise is trustworthy reporting.
+Operators who want multi-member coverage must opt into it knowingly rather than inherit a
+middle-ground behaviour nobody chose.
 
 ## Safety boundaries
 
@@ -150,3 +191,9 @@ The implementation does not use AppleScript or a display-name match for quitting
 6. **Process groups are not cgroups:** a PGID can include a shell or foreground job. Group termination is opt-in and deliberately guarded.
 7. **Identity edge cases:** bundle-less helpers and reparented processes without an app path remain singleton/process-group candidates rather than being guessed into an app.
 8. **Architecture:** the package currently targets macOS and uses Darwin/AppKit APIs; Linux builds are intentionally unsupported rather than pretending the metric is portable.
+9. **The default suppression set covers the processes you most want to act on.** `protect_current_user = true` and `protect_current_session = true` mean a freshly installed instance reports essentially every workload that matters on a desktop — the agent, the browser, the VM, the build — and acts on none of them, because they all run as the current user in the current session. This is not an oversight that a better heuristic would fix: at sample time the tool can see a footprint and a name, and nothing that distinguishes "this is my long-running project" from "this is a runaway". The policy chooses to protect both. Turning it off is the only way to reach these workloads, and that is a decision an operator has to make explicitly after reading reports.
+10. **`gui_escalation = never` makes every GUI application permanently report-only.** `CandidatePlanner.actionSafety` maps a verified app bundle to `reportOnly` on this value before considering any other rule, so no configuration short of setting this key acts on a `.app`. Because the default is the most conservative rung of a four-rung ladder whose higher rungs can each lose unsaved work or take out a login session, this is intended — but it does mean the shipped default has no GUI enforcement capability at all, and readers should not infer one from the existence of the escalation options.
+11. **Multi-member workloads are refused rather than partially handled.** See ["Why refuse the group"](#why-refuse-the-group-instead-of-pick-its-biggest-member). Under the defaults this creates a size-independent eligibility cliff at "two members above `minimum_candidate` in one group", not at "a large number of bytes".
+12. **`DarwinActionExecutor` has no automated test coverage.** The executor is excluded from the test target: no test constructs one, and no test exercises `SIGTERM`/`SIGKILL` delivery, the `NSRunningApplication` graceful-then-force path, the process-group gate, or the PID-reuse re-verification. Everything above the executor — parsing, suppression, grouping, ranking, plan selection, and the daemon's report-only seam — is covered. The practical effect is that the project's test suite can prove *which* action would be taken, and cannot prove *how* it would be delivered. This is the single highest-value thing to fix before anyone relies on enforcement in production; see [`DECISIONS.md`](DECISIONS.md) for the mutation evidence that demonstrates the gap rather than merely asserting it.
+13. **Threshold boundaries are untested.** `PressureLevel` uses `<=` against each configured fraction, so a sample landing exactly on `warn_available` or `kill_available` is classified as that level. No test pins that inclusive behaviour, and no test covers the ordering of the three comparisons beyond values clearly below each boundary. Changing `<=` to `<` today would leave the suite green.
+14. **Test discrimination is asymmetric.** Spot mutation checks confirm that the suite fails when badness ranking is switched from `phys_footprint` to RSS, and when the mandatory suppression names stop being unioned into the configured list — both safety-critical, both caught. The same method shows that disabling the executor's PID-reuse guard outright leaves the suite green. Read the suite as a strong regression net for policy, and as no net at all for delivery mechanics.

@@ -7,6 +7,8 @@ Thanks for improving earlyoom-mac. This project can terminate processes, so safe
 1. Read [`README.md`](README.md), [`docs/DESIGN.md`](docs/DESIGN.md), and [`docs/RESEARCH.md`](docs/RESEARCH.md).
 2. Open an issue for policy changes or new enforcement behavior. Explain the failure mode, the affected macOS versions, and why report-only behavior is insufficient.
 3. Keep examples and logs generic. Do not include usernames, hostnames, serial numbers, private repository names, or unredacted process command lines.
+4. Check [`docs/DECISIONS.md`](docs/DECISIONS.md) before proposing a change to the metric, the suppression baseline, the action ladder, or the grouping rules. Several of those choices exist precisely to avoid a failure mode that is easy to reintroduce by accident.
+5. When you overturn a recorded decision, replace the entry with the new reasoning rather than deleting it, and keep the verification evidence. An entry without evidence tends to become folklore within two releases.
 
 ## Development
 

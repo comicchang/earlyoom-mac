@@ -9,7 +9,7 @@ permissions:
 
 jobs:
   test:
-    runs-on: macos-14
+    runs-on: macos-15
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
@@ -19,5 +19,10 @@ jobs:
           swift-version: "6.0"
       - name: Run tests
         run: swift test
+      - name: Verify shipped configurations parse
+        run: |
+          swift run earlyoom-mac --print-default-config > "$RUNNER_TEMP/default.conf"
+          swift run earlyoom-mac --config "$RUNNER_TEMP/default.conf" --once > /dev/null
+          swift run earlyoom-mac --config config/earlyoom-mac.conf --once > /dev/null
       - name: Build release binary
         run: swift build -c release
