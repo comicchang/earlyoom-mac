@@ -1,6 +1,11 @@
 import Foundation
 import EarlyoomMac
 
+// Daemon output is the only forensics trail: unbuffer stdout so every report lands
+// immediately. The C stdio default (block-buffered when stdout is a file) delays
+// launchd StandardOutPath logs by thousands of bytes and drops the tail on SIGKILL.
+setbuf(stdout, nil)
+
 private func usage() {
     print("""
     Usage: earlyoom-mac [--config PATH] [--once] [--print-default-config]
