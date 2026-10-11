@@ -1,6 +1,25 @@
 import Foundation
 import Darwin
 
+public enum PressureBand: String, Sendable, Equatable {
+    case ok
+    case warn
+    case action
+
+    public init(pressure: PressureLevel) {
+        switch pressure {
+        case .normal: self = .ok
+        case .warn: self = .warn
+        case .terminate, .kill: self = .action
+        }
+    }
+}
+
+public enum ReportCadence: String, Sendable, Equatable {
+    case full
+    case heartbeat
+    case silent
+}
 public struct EarlyoomDaemon {
     public let config: EarlyoomConfig
     private let processSampler: any ProcessSampling
@@ -8,6 +27,10 @@ public struct EarlyoomDaemon {
     private let actionExecutor: any ProcessActionExecutor
     private let policy: SuppressionPolicy
     private let output: @Sendable (String) -> Void
+    private let errorOutput: @Sendable (String) -> Void
+    private let sleeper: @Sendable (Double) -> Void
+    private let clock: @Sendable () -> Date
+    public let enforceLock: EnforceLock?
 
     public init(
         config: EarlyoomConfig,
@@ -17,7 +40,11 @@ public struct EarlyoomDaemon {
         currentUID: UInt32 = getuid(),
         currentSessionID: Int32? = getsid(getpid()),
         daemonPID: Int32 = getpid(),
-        output: @escaping @Sendable (String) -> Void = { print($0) }
+        lockURL: URL? = nil,
+        output: @escaping @Sendable (String) -> Void = { print($0) },
+        errorOutput: @escaping @Sendable (String) -> Void = { fputs("\($0)\n", stderr) },
+        sleeper: @escaping @Sendable (Double) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        clock: @escaping @Sendable () -> Date = { Date() }
     ) {
         self.config = config
         self.processSampler = processSampler
@@ -25,10 +52,24 @@ public struct EarlyoomDaemon {
         self.actionExecutor = actionExecutor
         self.policy = SuppressionPolicy(config: config, currentUID: currentUID, currentSessionID: currentSessionID, daemonPID: daemonPID)
         self.output = output
+        self.errorOutput = errorOutput
+        self.sleeper = sleeper
+        self.clock = clock
+        if config.enabled && !config.reportOnly {
+            self.enforceLock = EnforceLock(url: lockURL ?? EnforceLock.defaultLockURL)
+        } else {
+            self.enforceLock = nil
+        }
     }
 
-    @discardableResult
-    public func runOnce() throws -> PlanningResult {
+    private struct IterationResult {
+        let memory: MemorySnapshot
+        let planningResult: PlanningResult
+        let actionOutcomes: [(ActionPlan, ActionExecutionOutcome)]
+        let actionError: Error?
+    }
+
+    private func executeIteration() throws -> IterationResult {
         let memory = try memorySampler.sample()
         let processes = try processSampler.sample()
         let planner = CandidatePlanner(config: config, policy: policy)
@@ -50,22 +91,139 @@ public struct EarlyoomDaemon {
                 actionOutcomes.append((plan, ActionExecutionOutcome(state: .rejected, reason: "not attempted after an executor error")))
             }
         }
-        output(Self.formatReport(memory: memory, result: result, enabled: config.enabled, reportOnly: config.reportOnly, actionOutcomes: actionOutcomes))
-        if let actionError { throw actionError }
-        return result
+        return IterationResult(
+            memory: memory,
+            planningResult: result,
+            actionOutcomes: actionOutcomes,
+            actionError: actionError
+        )
     }
-    public func run(repeatCount: Int? = nil) throws {
+
+    @discardableResult
+    public func runOnce() throws -> PlanningResult {
+        try enforceLock?.acquire()
+        defer { enforceLock?.release() }
+        let iteration = try executeIteration()
+        output(Self.formatReport(
+            memory: iteration.memory,
+            result: iteration.planningResult,
+            enabled: config.enabled,
+            reportOnly: config.reportOnly,
+            actionOutcomes: iteration.actionOutcomes
+        ))
+        if let actionError = iteration.actionError { throw actionError }
+        return iteration.planningResult
+    }
+
+    public func run(repeatCount: Int? = nil, stopOnSamplingError: Bool? = nil) throws {
+        try enforceLock?.acquire()
+        defer { enforceLock?.release() }
+
         var iterations = 0
+        let isOnce = (repeatCount == 1)
+        let shouldStopOnError = stopOnSamplingError ?? isOnce
+        var lastOutputTime: Date? = nil
+        var lastPressureBand: PressureBand? = nil
+        var cumulativeActions = 0
+
         while repeatCount == nil || iterations < repeatCount! {
-            _ = try runOnce()
+            let iteration: IterationResult
+            do {
+                iteration = try executeIteration()
+            } catch {
+                if shouldStopOnError {
+                    throw error
+                }
+                errorOutput("[error] sampling failed: \(error)")
+                iterations += 1
+                if repeatCount == nil || iterations < repeatCount! {
+                    sleeper(config.intervalSeconds)
+                }
+                continue
+            }
+
+            let acted = iteration.actionOutcomes.contains { $0.1.state == .executed }
+            let deliveredCount = iteration.actionOutcomes.filter { $0.1.state == .executed }.count
+            cumulativeActions += deliveredCount
+            let hasActionOutcomes = !iteration.actionOutcomes.isEmpty
+
+            let currentBand = PressureBand(pressure: iteration.planningResult.pressure)
+            let isFirstRun = (lastOutputTime == nil)
+            let now = clock()
+            let elapsed = lastOutputTime.map { now.timeIntervalSince($0) } ?? 0
+
+            let cadence = Self.determineReportCadence(
+                isFirstRun: isFirstRun,
+                previousBand: lastPressureBand,
+                currentBand: currentBand,
+                hasActionOutcomes: hasActionOutcomes,
+                elapsedSinceLastOutput: elapsed,
+                heartbeatSeconds: config.heartbeatSeconds,
+                isOnce: isOnce
+            )
+
+            switch cadence {
+            case .full:
+                output(Self.formatReport(
+                    memory: iteration.memory,
+                    result: iteration.planningResult,
+                    enabled: config.enabled,
+                    reportOnly: config.reportOnly,
+                    actionOutcomes: iteration.actionOutcomes
+                ))
+                lastOutputTime = now
+            case .heartbeat:
+                output(Self.formatHeartbeat(
+                    memory: iteration.memory,
+                    result: iteration.planningResult,
+                    enabled: config.enabled,
+                    reportOnly: config.reportOnly,
+                    cumulativeActions: cumulativeActions
+                ))
+                lastOutputTime = now
+            case .silent:
+                break
+            }
+
+            lastPressureBand = currentBand
             iterations += 1
+
+            if let actionError = iteration.actionError {
+                throw actionError
+            }
+
             if repeatCount == nil || iterations < repeatCount! {
-                Thread.sleep(forTimeInterval: config.intervalSeconds)
+                let sleepDuration = acted ? min(1.0, config.intervalSeconds) : config.intervalSeconds
+                sleeper(sleepDuration)
             }
         }
     }
 
-    public static func formatReport(memory: MemorySnapshot, result: PlanningResult, enabled: Bool, reportOnly: Bool, actionOutcomes: [(ActionPlan, ActionExecutionOutcome)] = []) -> String {
+    public static func determineReportCadence(
+        isFirstRun: Bool,
+        previousBand: PressureBand?,
+        currentBand: PressureBand,
+        hasActionOutcomes: Bool,
+        elapsedSinceLastOutput: Double,
+        heartbeatSeconds: Double,
+        isOnce: Bool = false
+    ) -> ReportCadence {
+        if isOnce || isFirstRun || previousBand != currentBand || hasActionOutcomes {
+            return .full
+        }
+        if heartbeatSeconds > 0 && elapsedSinceLastOutput >= heartbeatSeconds {
+            return .heartbeat
+        }
+        return .silent
+    }
+
+    public static func formatReport(
+        memory: MemorySnapshot,
+        result: PlanningResult,
+        enabled: Bool,
+        reportOnly: Bool,
+        actionOutcomes: [(ActionPlan, ActionExecutionOutcome)] = []
+    ) -> String {
         let mode = !enabled || reportOnly ? "report-only" : "enforce"
         let available = memory.physicalBytes == 0 ? 0 : (Double(memory.availableBytes) / Double(memory.physicalBytes)) * 100
         let availableText = String(format: "%.1f", available)
@@ -84,5 +242,27 @@ public struct EarlyoomDaemon {
             lines.append("result pid=\(plan.group.representative.pid) target=\(plan.group.application?.bundleIdentifier ?? plan.group.representative.name) state=\(outcome.state.rawValue) reason=\(outcome.reason)")
         }
         return lines.joined(separator: "\n")
+    }
+
+    public static func formatHeartbeat(
+        memory: MemorySnapshot,
+        result: PlanningResult,
+        enabled: Bool,
+        reportOnly: Bool,
+        cumulativeActions: Int
+    ) -> String {
+        let mode = !enabled || reportOnly ? "report-only" : "enforce"
+        let available = memory.physicalBytes == 0 ? 0 : (Double(memory.availableBytes) / Double(memory.physicalBytes)) * 100
+        let availableText = String(format: "%.1f", available)
+        let topTarget: String
+        let topBadness: String
+        if let topGroup = result.groups.first {
+            topTarget = topGroup.application?.bundleIdentifier ?? topGroup.representative.name
+            topBadness = String(format: "%.3f", topGroup.badness)
+        } else {
+            topTarget = "none"
+            topBadness = "0.000"
+        }
+        return "[earlyoom] heartbeat mode=\(mode) pressure=\(result.pressure.rawValue) available=\(availableText)% top=\(topTarget) badness=\(topBadness) actions=\(cumulativeActions)"
     }
 }

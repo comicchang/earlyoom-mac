@@ -52,11 +52,14 @@ do {
         fputs("earlyoom-mac: no config supplied; using safe report-only defaults\n", stderr)
     }
     let executor: any ProcessActionExecutor = config.enabled && !config.reportOnly
-        ? DarwinActionExecutor()
+        ? DarwinActionExecutor(config: config, memorySampler: DarwinMemorySampler())
         : DryRunActionExecutor()
     let daemon = EarlyoomDaemon(config: config, actionExecutor: executor)
     try daemon.run(repeatCount: once ? 1 : nil)
+} catch EarlyoomError.invalidConfiguration(let message) {
+    fputs("earlyoom-mac: invalid configuration: \(message)\n", stderr)
+    exit(1)
 } catch {
     fputs("earlyoom-mac: \(error)\n", stderr)
-    exit(1)
+    exit(2)
 }

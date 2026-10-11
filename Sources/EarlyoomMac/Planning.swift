@@ -179,8 +179,51 @@ public struct DryRunActionExecutor: ProcessActionExecutor, Sendable {
 }
 
 #if canImport(AppKit)
-public struct DarwinActionExecutor: ProcessActionExecutor {
-    public init() {}
+public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
+    public let memorySampler: any MemorySampling
+    public let killAvailableFraction: Double
+    public let gracePollSeconds: Double
+    private let sleeper: @Sendable (Double) -> Void
+    private let pidVerifier: @Sendable (Int32, UInt64) -> Bool
+    private let signalSender: @Sendable (Int32, Int32) -> Int32
+
+    public init(
+        memorySampler: any MemorySampling = DarwinMemorySampler(),
+        killAvailableFraction: Double = 0.05,
+        gracePollSeconds: Double = 1.0,
+        sleeper: @escaping @Sendable (Double) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        pidVerifier: (@Sendable (Int32, UInt64) -> Bool)? = nil,
+        signalSender: (@Sendable (Int32, Int32) -> Int32)? = nil
+    ) {
+        self.memorySampler = memorySampler
+        self.killAvailableFraction = killAvailableFraction
+        self.gracePollSeconds = gracePollSeconds
+        self.sleeper = sleeper
+        self.pidVerifier = pidVerifier ?? { pid, expectedStartTime in
+            Self.checkProcessIdentity(pid: pid, expectedStartTime: expectedStartTime)
+        }
+        self.signalSender = signalSender ?? { pid, sig in
+            kill(pid, sig)
+        }
+    }
+
+    public init(
+        config: EarlyoomConfig,
+        memorySampler: any MemorySampling = DarwinMemorySampler(),
+        gracePollSeconds: Double = 1.0,
+        sleeper: @escaping @Sendable (Double) -> Void = { Thread.sleep(forTimeInterval: $0) },
+        pidVerifier: (@Sendable (Int32, UInt64) -> Bool)? = nil,
+        signalSender: (@Sendable (Int32, Int32) -> Int32)? = nil
+    ) {
+        self.init(
+            memorySampler: memorySampler,
+            killAvailableFraction: config.killAvailableFraction,
+            gracePollSeconds: gracePollSeconds,
+            sleeper: sleeper,
+            pidVerifier: pidVerifier,
+            signalSender: signalSender
+        )
+    }
 
     public func execute(_ plan: ActionPlan, gracePeriodSeconds: Double) throws {
         _ = try executeWithOutcome(plan, gracePeriodSeconds: gracePeriodSeconds)
@@ -220,7 +263,7 @@ public struct DarwinActionExecutor: ProcessActionExecutor {
             }
             var delivered = false
             for application in applications { delivered = application.terminate() || delivered }
-            Thread.sleep(forTimeInterval: max(0, gracePeriodSeconds))
+            _ = waitGracePeriod(pids: Array(pids), gracePeriodSeconds: gracePeriodSeconds)
             for application in applications where !application.isTerminated {
                 guard let startTime = startTimes[application.processIdentifier],
                       isSameProcess(pid: application.processIdentifier, expectedStartTime: startTime) else { continue }
@@ -253,18 +296,21 @@ public struct DarwinActionExecutor: ProcessActionExecutor {
             guard groupID > 1, plan.group.members.allSatisfy(isSameProcess) else {
                 return ActionExecutionOutcome(state: .rejected, reason: "sampled process-group identity changed")
             }
-            guard kill(-groupID, 0) == 0 || errno == EPERM else {
+            guard signalSender(-groupID, 0) == 0 || errno == EPERM else {
                 return ActionExecutionOutcome(state: .rejected, reason: "process group is no longer present")
             }
             var delivered = false
-            if kill(-groupID, SIGTERM) == 0 {
+            if signalSender(-groupID, SIGTERM) == 0 {
                 delivered = true
             } else if errno != ESRCH {
                 throw EarlyoomError.cannotReadProcess(groupID, "SIGTERM failed: \(String(cString: strerror(errno)))")
             }
-            Thread.sleep(forTimeInterval: max(0, gracePeriodSeconds))
-            if kill(-groupID, 0) == 0 || errno == EPERM {
-                if kill(-groupID, SIGKILL) == 0 {
+            _ = waitGracePeriod(pids: plan.group.members.map(\.pid), gracePeriodSeconds: gracePeriodSeconds)
+            if signalSender(-groupID, 0) == 0 || errno == EPERM {
+                guard plan.group.members.allSatisfy(isSameProcess) else {
+                    return executionOutcome(delivered: delivered, reason: "sampled process-group identity changed before SIGKILL")
+                }
+                if signalSender(-groupID, SIGKILL) == 0 {
                     delivered = true
                 } else if errno != ESRCH {
                     throw EarlyoomError.cannotReadProcess(groupID, "SIGKILL failed: \(String(cString: strerror(errno)))")
@@ -286,21 +332,51 @@ public struct DarwinActionExecutor: ProcessActionExecutor {
         return delivered
     }
 
+    private func isPIDAlive(_ pid: Int32) -> Bool {
+        guard pid > 1 else { return false }
+        let res = signalSender(pid, 0)
+        return res == 0 || errno == EPERM
+    }
+
     private func signal(pid: Int32, signal: Int32) throws -> Bool {
         guard pid > 1 else { return false }
-        if kill(pid, signal) != 0 {
+        if signalSender(pid, signal) != 0 {
             if errno == ESRCH { return false }
             throw EarlyoomError.cannotReadProcess(pid, "signal failed: \(String(cString: strerror(errno)))")
         }
         return true
     }
 
+    @discardableResult
+    private func waitGracePeriod(
+        pids: [Int32],
+        gracePeriodSeconds: Double
+    ) -> Bool {
+        var remaining = max(0, gracePeriodSeconds)
+        while remaining > 0 {
+            if !pids.isEmpty && pids.allSatisfy({ !isPIDAlive($0) }) {
+                return false
+            }
+            let chunk = min(gracePollSeconds, remaining)
+            sleeper(chunk)
+            remaining -= chunk
+
+            if let memory = try? memorySampler.sample() {
+                let available = memory.physicalBytes == 0 ? 0 : Double(memory.availableBytes) / Double(memory.physicalBytes)
+                if available <= killAvailableFraction {
+                    return true
+                }
+            }
+        }
+        return false
+    }
+
     private func waitAndKillIfAlive(members: [ProcessSnapshot], gracePeriodSeconds: Double) throws -> Int {
-        Thread.sleep(forTimeInterval: max(0, gracePeriodSeconds))
+        _ = waitGracePeriod(pids: members.map(\.pid), gracePeriodSeconds: gracePeriodSeconds)
         var delivered = 0
         for member in members where member.pid > 1 {
             guard isSameProcess(member) else { continue }
-            if kill(member.pid, 0) == 0 || errno == EPERM {
+            if isPIDAlive(member.pid) {
                 if try signal(pid: member.pid, signal: SIGKILL) { delivered += 1 }
             }
         }
@@ -312,6 +388,11 @@ public struct DarwinActionExecutor: ProcessActionExecutor {
     }
 
     private func isSameProcess(pid: Int32, expectedStartTime: UInt64) -> Bool {
+        guard pid > 1, expectedStartTime > 0 else { return false }
+        return pidVerifier(pid, expectedStartTime)
+    }
+
+    public static func checkProcessIdentity(pid: Int32, expectedStartTime: UInt64) -> Bool {
         guard pid > 1, expectedStartTime > 0 else { return false }
         var bsd = proc_bsdinfo()
         let size = Int32(MemoryLayout<proc_bsdinfo>.stride)

@@ -210,3 +210,512 @@ func daemonDefaultDoesNotAct() throws {
     #expect(result.pressure == .kill)
     #expect(recorder.calls == 0)
 }
+
+private final class LockedBox<T>: @unchecked Sendable {
+    private var value: T
+    private let lock = NSLock()
+
+    init(_ value: T) {
+        self.value = value
+    }
+
+    func withValue<R>(_ body: (inout T) -> R) -> R {
+        lock.lock()
+        defer { lock.unlock() }
+        return body(&value)
+    }
+
+    var current: T {
+        lock.lock()
+        defer { lock.unlock() }
+        return value
+    }
+}
+private struct SignalRecord: Equatable, Sendable {
+    let pid: Int32
+    let sig: Int32
+}
+
+private final class MutableMemorySampler: MemorySampling, @unchecked Sendable {
+    private var snapshots: [MemorySnapshot]
+    private let lock = NSLock()
+
+    init(snapshots: [MemorySnapshot]) {
+        self.snapshots = snapshots
+    }
+
+    func sample() throws -> MemorySnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        if snapshots.count > 1 {
+            return snapshots.removeFirst()
+        }
+        return snapshots.first!
+    }
+}
+
+private final class FailingSampler: MemorySampling, @unchecked Sendable {
+    var callCount = 0
+    let lock = NSLock()
+    let errorOnFirstCall: Bool
+
+    init(errorOnFirstCall: Bool = true) {
+        self.errorOnFirstCall = errorOnFirstCall
+    }
+
+    func sample() throws -> MemorySnapshot {
+        lock.lock()
+        defer { lock.unlock() }
+        callCount += 1
+        if errorOnFirstCall && callCount == 1 {
+            throw EarlyoomError.cannotReadMemory("simulated sampling error")
+        }
+        return MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 8 * gib)
+    }
+}
+
+private final class MockActionExecutor: ProcessActionExecutor, @unchecked Sendable {
+    let outcome: ActionExecutionOutcome
+    var executedPlans: [ActionPlan] = []
+    let lock = NSLock()
+
+    init(outcome: ActionExecutionOutcome) {
+        self.outcome = outcome
+    }
+
+    func execute(_ plan: ActionPlan, gracePeriodSeconds: Double) throws {
+        lock.lock()
+        defer { lock.unlock() }
+        executedPlans.append(plan)
+    }
+
+    func executeWithOutcome(_ plan: ActionPlan, gracePeriodSeconds: Double) throws -> ActionExecutionOutcome {
+        lock.lock()
+        defer { lock.unlock() }
+        executedPlans.append(plan)
+        return outcome
+    }
+}
+
+@Test("configuration parses and validates heartbeat duration")
+func heartbeatConfiguration() throws {
+    let defaultConfig = try EarlyoomConfig.parse(text: EarlyoomConfig.defaultConfigurationText)
+    #expect(defaultConfig.heartbeatSeconds == 300)
+
+    let customText = """
+    [earlyoom]
+    enabled = false
+    report_only = true
+    interval = 5s
+    grace_period = 10s
+    heartbeat = 45s
+
+    [check]
+    metric = phys_footprint
+    warn_available = 20%
+    terminate_available = 10%
+    kill_available = 5%
+    minimum_candidate = 64MiB
+    """
+    let customConfig = try EarlyoomConfig.parse(text: customText)
+    #expect(customConfig.heartbeatSeconds == 45)
+
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[earlyoom]\nheartbeat = -5s\n")
+    }
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[earlyoom]\nheartbeat = 0s\n")
+    }
+}
+
+@Test("report cadence decision table covers full, heartbeat, and silent modes")
+func reportCadenceDecisionTable() {
+    // First run is always full
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: true,
+        previousBand: nil,
+        currentBand: .ok,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 0,
+        heartbeatSeconds: 300
+    ) == .full)
+
+    // Steady state without change is silent
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .ok,
+        currentBand: .ok,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 50,
+        heartbeatSeconds: 300
+    ) == .silent)
+
+    // Band change triggers full report
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .ok,
+        currentBand: .warn,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 50,
+        heartbeatSeconds: 300
+    ) == .full)
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .warn,
+        currentBand: .action,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 10,
+        heartbeatSeconds: 300
+    ) == .full)
+
+    // Action outcomes (executed, attempted, or rejected) trigger full report
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .action,
+        currentBand: .action,
+        hasActionOutcomes: true,
+        elapsedSinceLastOutput: 2,
+        heartbeatSeconds: 300
+    ) == .full)
+
+    // Heartbeat elapsed triggers heartbeat line
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .ok,
+        currentBand: .ok,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 300,
+        heartbeatSeconds: 300
+    ) == .heartbeat)
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .ok,
+        currentBand: .ok,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 350,
+        heartbeatSeconds: 300
+    ) == .heartbeat)
+
+    // --once mode is always full
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousBand: .ok,
+        currentBand: .ok,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 10,
+        heartbeatSeconds: 300,
+        isOnce: true
+    ) == .full)
+}
+
+@Test("daemon cadence outputs full report on first run, suppresses steady state, and emits heartbeat summary")
+func daemonCadenceInSteadyState() throws {
+    let timeBox = LockedBox(Date(timeIntervalSince1970: 1000))
+    let nowProvider: @Sendable () -> Date = {
+        timeBox.current
+    }
+
+    let outputBox = LockedBox<[String]>([])
+    let outputCollector: @Sendable (String) -> Void = { line in
+        outputBox.withValue { $0.append(line) }
+    }
+
+    var config = EarlyoomConfig.safeReportOnly
+    config.heartbeatSeconds = 300
+    config.intervalSeconds = 5
+
+    let daemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [process(pid: 88, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 12 * gib)),
+        actionExecutor: RecordingExecutor(),
+        output: outputCollector,
+        sleeper: { _ in },
+        clock: nowProvider
+    )
+
+    // Iteration 1: first run -> outputs full report
+    try daemon.run(repeatCount: 1)
+    #expect(outputBox.current.count == 1)
+    #expect(outputBox.current[0].hasPrefix("mode=report-only pressure=normal"))
+
+    // Run 3 iterations continuously in one call to test steady state & heartbeat transition
+    let continuousOutputBox = LockedBox<[String]>([])
+    let continuousDaemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [process(pid: 88, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 12 * gib)),
+        actionExecutor: RecordingExecutor(),
+        output: { line in
+            continuousOutputBox.withValue { $0.append(line) }
+        },
+        sleeper: { _ in
+            timeBox.withValue { $0 = $0.addingTimeInterval(150) }
+        },
+        clock: nowProvider
+    )
+
+    try continuousDaemon.run(repeatCount: 3)
+    let logs = continuousOutputBox.current
+    #expect(logs.count == 2)
+    #expect(logs[0].hasPrefix("mode=report-only"))
+    #expect(logs[1].hasPrefix("[earlyoom] heartbeat mode=report-only"))
+    #expect(logs[1].contains("pressure=normal"))
+    #expect(logs[1].contains("available="))
+    #expect(logs[1].contains("top="))
+    #expect(logs[1].contains("actions="))
+}
+
+@Test("daemon loop skips round on sampling failure and logs error to stderr")
+func daemonSamplingFailureSkipsRound() throws {
+    let failingSampler = FailingSampler(errorOnFirstCall: true)
+    let errorBox = LockedBox<[String]>([])
+
+    let daemon = EarlyoomDaemon(
+        config: EarlyoomConfig.safeReportOnly,
+        processSampler: FixedProcessSampler(values: [process(pid: 88, footprint: 8 * gib, rss: mib)]),
+        memorySampler: failingSampler,
+        actionExecutor: RecordingExecutor(),
+        output: { _ in },
+        errorOutput: { err in
+            errorBox.withValue { $0.append(err) }
+        },
+        sleeper: { _ in }
+    )
+
+    try daemon.run(repeatCount: 2, stopOnSamplingError: false)
+    let errors = errorBox.current
+    #expect(errors.count == 1)
+    #expect(errors[0].contains("[error] sampling failed:"))
+    #expect(failingSampler.callCount == 2)
+
+    let failingOnceSampler = FailingSampler(errorOnFirstCall: true)
+    let onceDaemon = EarlyoomDaemon(
+        config: EarlyoomConfig.safeReportOnly,
+        processSampler: FixedProcessSampler(values: []),
+        memorySampler: failingOnceSampler,
+        actionExecutor: RecordingExecutor(),
+        output: { _ in }
+    )
+    #expect(throws: EarlyoomError.self) {
+        try onceDaemon.run(repeatCount: 1)
+    }
+}
+
+@Test("enforce mode single-instance lock prevents concurrent execution")
+func enforceLockSingleInstanceMutex() throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("earlyoom-lock-test-\(UUID().uuidString)")
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+    let lockURL = tempDir.appendingPathComponent("enforce.lock")
+
+    let reportOnlyDaemon = EarlyoomDaemon(
+        config: EarlyoomConfig.safeReportOnly,
+        lockURL: lockURL,
+        output: { _ in }
+    )
+    #expect(reportOnlyDaemon.enforceLock == nil)
+
+    let lock1 = EnforceLock(url: lockURL)
+    try lock1.acquire()
+    #expect(lock1.isHeld == true)
+
+    let lock2 = EnforceLock(url: lockURL)
+    #expect(throws: EarlyoomError.self) {
+        try lock2.acquire()
+    }
+
+    lock1.release()
+    #expect(lock1.isHeld == false)
+    try lock2.acquire()
+    #expect(lock2.isHeld == true)
+    lock2.release()
+}
+
+@Test("DarwinActionExecutor performs early SIGKILL when memory pressure drops below kill threshold during grace period")
+func gracePeriodEarlyKillOnPressureDrop() throws {
+    let mem1 = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(1.6 * Double(gib)))
+    let mem2 = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(0.64 * Double(gib)))
+    let dynamicMemorySampler = MutableMemorySampler(snapshots: [mem1, mem2])
+
+    let signalBox = LockedBox<[SignalRecord]>([])
+    let mockSender: @Sendable (Int32, Int32) -> Int32 = { pid, sig in
+        signalBox.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+        return 0
+    }
+
+    let sleepBox = LockedBox<[Double]>([])
+    let mockSleeper: @Sendable (Double) -> Void = { duration in
+        sleepBox.withValue { $0.append(duration) }
+    }
+
+    let executor = DarwinActionExecutor(
+        memorySampler: dynamicMemorySampler,
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: mockSleeper,
+        pidVerifier: { pid, startTime in true },
+        signalSender: mockSender
+    )
+
+    let targetProcess = ProcessSnapshot(
+        pid: 7777,
+        parentPID: 1,
+        processGroupID: 7777,
+        sessionID: 10,
+        userID: 501,
+        name: "runaway-worker",
+        physicalBytes: 4 * gib,
+        residentBytes: 2 * gib,
+        startTimeSeconds: 12345
+    )
+    let group = CandidateGroup(
+        key: "process:7777",
+        representative: targetProcess,
+        members: [targetProcess],
+        physicalBytes: 4 * gib,
+        residentBytes: 2 * gib,
+        application: nil,
+        badness: 0.25,
+        safety: .singleProcess
+    )
+    let plan = ActionPlan(group: group, safety: .singleProcess, reason: "exceeded memory threshold")
+
+    let outcome = try executor.executeWithOutcome(plan, gracePeriodSeconds: 10.0)
+    #expect(outcome.state == .executed)
+
+    let deliveredSignals = signalBox.current.filter { $0.sig != 0 }
+    #expect(deliveredSignals == [SignalRecord(pid: 7777, sig: SIGTERM), SignalRecord(pid: 7777, sig: SIGKILL)])
+    let sleepDurations = sleepBox.current
+    #expect(sleepDurations.count == 2)
+    #expect(sleepDurations.reduce(0, +) == 2.0)
+}
+
+@Test("DarwinActionExecutor respects PID reuse guard before delivering SIGKILL")
+func gracePeriodPIDReuseGuard() throws {
+    let mem = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(0.5 * Double(gib)))
+
+    // Case 1: First check (before SIGTERM) passes, second check (before SIGKILL) fails.
+    // Proves that SIGKILL-stage identity re-verification actively prevents sending SIGKILL
+    // to a reused PID.
+    let callCountBox = LockedBox<Int>(0)
+    let reusedSignalBox = LockedBox<[SignalRecord]>([])
+
+    let reuseGuardedExecutor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { _ in },
+        pidVerifier: { pid, startTime in
+            callCountBox.withValue { count in
+                count += 1
+                return count == 1 // 1st call (pre-TERM) succeeds, 2nd call (pre-KILL) fails
+            }
+        },
+        signalSender: { pid, sig in
+            reusedSignalBox.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            return 0
+        }
+    )
+
+    let targetProcess = ProcessSnapshot(
+        pid: 8888,
+        parentPID: 1,
+        processGroupID: 8888,
+        sessionID: 10,
+        userID: 501,
+        name: "worker",
+        physicalBytes: 4 * gib,
+        residentBytes: 2 * gib,
+        startTimeSeconds: 99999
+    )
+    let group = CandidateGroup(
+        key: "process:8888",
+        representative: targetProcess,
+        members: [targetProcess],
+        physicalBytes: 4 * gib,
+        residentBytes: 2 * gib,
+        application: nil,
+        badness: 0.25,
+        safety: .singleProcess
+    )
+    let plan = ActionPlan(group: group, safety: .singleProcess, reason: "memory limit")
+
+    let outcomeReused = try reuseGuardedExecutor.executeWithOutcome(plan, gracePeriodSeconds: 5.0)
+    #expect(outcomeReused.state == .executed)
+    let nonZeroReused = reusedSignalBox.current.filter { $0.sig != 0 }
+    #expect(nonZeroReused == [SignalRecord(pid: 8888, sig: SIGTERM)])
+    #expect(callCountBox.current >= 2)
+
+    // Case 2: Both checks pass -> SIGKILL is reachable and delivered.
+    let reachableSignalBox = LockedBox<[SignalRecord]>([])
+    let verifiedExecutor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { _ in },
+        pidVerifier: { pid, startTime in true },
+        signalSender: { pid, sig in
+            reachableSignalBox.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            return 0
+        }
+    )
+
+    let outcomeVerified = try verifiedExecutor.executeWithOutcome(plan, gracePeriodSeconds: 5.0)
+    #expect(outcomeVerified.state == .executed)
+    let nonZeroVerified = reachableSignalBox.current.filter { $0.sig != 0 }
+    #expect(nonZeroVerified == [SignalRecord(pid: 8888, sig: SIGTERM), SignalRecord(pid: 8888, sig: SIGKILL)])
+}
+
+@Test("daemon fast resamples within 1s after executing an action")
+func daemonFastResampleAfterAction() throws {
+    let sleepBox = LockedBox<[Double]>([])
+    let mockSleeper: @Sendable (Double) -> Void = { duration in
+        sleepBox.withValue { $0.append(duration) }
+    }
+
+    var config = permissiveEnforcementConfig()
+    config.enabled = true
+    config.reportOnly = false
+    config.intervalSeconds = 5.0
+
+    let actingExecutor = MockActionExecutor(outcome: ActionExecutionOutcome(state: .executed, reason: "action executed"))
+
+    let actingDaemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [process(pid: 44, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 128 * mib)),
+        actionExecutor: actingExecutor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("lock-\(UUID().uuidString)"),
+        output: { _ in },
+        sleeper: mockSleeper
+    )
+
+    try actingDaemon.run(repeatCount: 2)
+    let actingSleeps = sleepBox.current
+    #expect(actingSleeps.count == 1)
+    #expect(actingSleeps[0] <= 1.0)
+
+    sleepBox.withValue { $0.removeAll() }
+    let idleExecutor = MockActionExecutor(outcome: ActionExecutionOutcome(state: .rejected, reason: "no action"))
+    let idleDaemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [process(pid: 44, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 128 * mib)),
+        actionExecutor: idleExecutor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("lock-\(UUID().uuidString)"),
+        output: { _ in },
+        sleeper: mockSleeper
+    )
+
+    try idleDaemon.run(repeatCount: 2)
+    let idleSleeps = sleepBox.current
+    #expect(idleSleeps.count == 1)
+    #expect(idleSleeps[0] == 5.0)
+}

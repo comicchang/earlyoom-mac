@@ -155,6 +155,8 @@ public enum EarlyoomError: Error, CustomStringConvertible, Sendable {
     case cannotReadMemory(String)
     case cannotReadProcess(Int32, String)
     case unsupportedPlatform(String)
+    case lockAlreadyHeld(String)
+    case cannotAcquireLock(String)
 
     public var description: String {
         switch self {
@@ -163,6 +165,8 @@ public enum EarlyoomError: Error, CustomStringConvertible, Sendable {
         case .cannotReadMemory(let message): return "cannot read memory statistics: \(message)"
         case .cannotReadProcess(let pid, let message): return "cannot read process \(pid): \(message)"
         case .unsupportedPlatform(let message): return "unsupported platform: \(message)"
+        case .lockAlreadyHeld(let message): return "enforce lock already held: \(message)"
+        case .cannotAcquireLock(let message): return "cannot acquire enforce lock: \(message)"
         }
     }
 }

@@ -8,6 +8,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
     public var terminateAvailableFraction: Double
     public var killAvailableFraction: Double
     public var gracePeriodSeconds: Double
+    public var heartbeatSeconds: Double
     public var minimumCandidatePhysicalBytes: UInt64
     /// Exact case-insensitive process-name multipliers for badness ranking.
     /// Missing names use 1.0.
@@ -30,6 +31,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
         terminateAvailableFraction: Double,
         killAvailableFraction: Double,
         gracePeriodSeconds: Double,
+        heartbeatSeconds: Double = 300,
         minimumCandidatePhysicalBytes: UInt64,
         criticalityWeights: [String: Double] = [:],
         guiEscalation: GUIEscalation,
@@ -49,6 +51,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
         self.terminateAvailableFraction = terminateAvailableFraction
         self.killAvailableFraction = killAvailableFraction
         self.gracePeriodSeconds = gracePeriodSeconds
+        self.heartbeatSeconds = heartbeatSeconds
         self.minimumCandidatePhysicalBytes = minimumCandidatePhysicalBytes
         self.criticalityWeights = criticalityWeights
         self.guiEscalation = guiEscalation
@@ -72,6 +75,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
         terminateAvailableFraction: 0.10,
         killAvailableFraction: 0.05,
         gracePeriodSeconds: 10,
+        heartbeatSeconds: 300,
         minimumCandidatePhysicalBytes: 64 * 1024 * 1024,
         guiEscalation: .never,
         allowProcessGroupTermination: false,
@@ -91,6 +95,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
     report_only = true
     interval = 5s
     grace_period = 10s
+    heartbeat = 300s
 
     [check]
     metric = phys_footprint
@@ -124,7 +129,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
         var section = ""
         var seen = Set<String>()
         let supported: [String: Set<String>] = [
-            "earlyoom": ["enabled", "report_only", "interval", "grace_period"],
+            "earlyoom": ["enabled", "report_only", "interval", "grace_period", "heartbeat"],
             "check": ["metric", "warn_available", "terminate_available", "kill_available", "minimum_candidate", "criticality"],
             "action": ["gui_escalation", "allow_process_group"],
             "suppression": ["protect_current_user", "protect_current_session", "protect_ancestors", "protect_process_groups", "names", "bundle_ids", "extra_uids"]
@@ -155,6 +160,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
             case "earlyoom.report_only": config.reportOnly = try parseBool(value, lineNumber)
             case "earlyoom.interval": config.intervalSeconds = try parseDuration(value, lineNumber)
             case "earlyoom.grace_period": config.gracePeriodSeconds = try parseDuration(value, lineNumber)
+            case "earlyoom.heartbeat": config.heartbeatSeconds = try parseDuration(value, lineNumber)
             case "check.metric":
                 guard value.lowercased() == "phys_footprint" else {
                     throw EarlyoomError.invalidConfiguration("line \(lineNumber + 1): metric must be phys_footprint")
@@ -190,6 +196,7 @@ public struct EarlyoomConfig: Equatable, Sendable {
 
         guard config.intervalSeconds > 0 else { throw EarlyoomError.invalidConfiguration("interval must be greater than zero") }
         guard config.gracePeriodSeconds >= 0 else { throw EarlyoomError.invalidConfiguration("grace_period cannot be negative") }
+        guard config.heartbeatSeconds > 0 else { throw EarlyoomError.invalidConfiguration("heartbeat must be greater than zero") }
         guard config.warnAvailableFraction > config.terminateAvailableFraction,
               config.terminateAvailableFraction > config.killAvailableFraction,
               config.killAvailableFraction >= 0,
