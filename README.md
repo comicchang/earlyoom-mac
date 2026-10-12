@@ -147,7 +147,7 @@ Before arming it:
 - **Protected target / ambiguous identity:** never act.
 - **Thread-level action:** never act.
 
-Every plan is produced after suppression and identity checks. The executor rejects report-only/protected plans independently of the planner.
+Every plan is produced after suppression and identity checks. At most one eligible candidate group (the highest-badness group) is given an executable action per round, followed by a fast resample (`min(1s, interval)`). `ProcessActionExecutor` implementations (`DryRunActionExecutor` and `DarwinActionExecutor`) reject report-only/protected plans independently of `CandidatePlanner`.
 
 ## Behavior boundaries and risks
 
@@ -170,8 +170,8 @@ safe-but-limited side.
 1. **The defaults protect the very processes you probably want gone.** `protect_current_user = true` (the default) suppresses *every* process owned by the daemon's UID, not just the daemon's own tree. The runaway workload that motivates a memory-pressure watchdog — an agent kernel, a browser, a VM, a build — normally runs as that same user, so under the shipped configuration it is reported and never acted on. Reaching it requires setting `protect_current_user = false`, which also disarms the guard that keeps the watchdog from targeting the operator's own session. This is a deliberate trade: the safe default cannot distinguish "my important work" from "my runaway work", so it protects both.
 2. **GUI applications can never be acted on under the default policy.** `gui_escalation = never` (the default) maps every verified app bundle to `reportOnly` in `CandidatePlanner.actionSafety`, so even with both enable gates set to their enforcement values, a macOS `.app` is reported and left running. The escalation ladder (`graceful_then_force`, `force_application`, `process_group`) exists and is tested at the planning level, but it is inert until an operator opts in — and each rung is destructive in a different way, which is exactly why none of them is the default.
 3. **A workload with more than one process is refused entirely, not handled piecemeal.** When `allow_process_group = false` (the default) and a candidate group contains more than one member, the planner returns `reportOnly` for the *whole group* rather than terminating one member. It does **not** fall back to per-process termination of the largest member. The practical consequence is asymmetric and worth stating plainly: a genuinely single-process hog — one VM process, one compiler process, one runaway daemon — remains eligible under the default settings, while a multi-process workload (a browser plus its helpers, a worker pool, a build system fanning out) is never eligible no matter how large it grows, until `allow_process_group = true` is set. Members are grouped *after* the `minimum_candidate` filter, so a workload whose helpers each sit below `64MiB` can still collapse into a single-member group and stay eligible — it is the number of members above that threshold, not the raw process count, that decides. See [`docs/DESIGN.md`](docs/DESIGN.md) for why picking a representative was rejected rather than merely deprioritized.
-4. **Enforcement delivery mechanics are tested via injected mocks rather than live system signals.** `DarwinActionExecutor` — the `SIGTERM`/`SIGKILL` delivery, grace-period pressure drop early SIGKILL, and PID-reuse re-verification — is covered by automated unit tests via dependency injection (`MemorySampling`, process identity verifier, signal sender), avoiding destructive signals during test runs while rigorously verifying delivery decision mechanics. Live system signal integration remains an operator responsibility.
-5. **Test discrimination covers policy and delivery mechanics via seams.** The test suite verifies selection policy (ranking by `phys_footprint`, mandatory name protection) as well as delivery mechanics (PID-reuse guard refusal, early SIGKILL on pressure drop, enforce-mode flock exclusion).
+4. **Enforcement delivery mechanics are unit-tested via injected seams for `.singleProcess` and `.processGroup`, while GUI `NSRunningApplication` execution and live OS signals are not.** `DarwinActionExecutor` — `SIGTERM`/`SIGKILL` delivery, grace-period pressure drop early `SIGKILL`, `grace_period = 0s`, partial process-group exit escalation, and PID-reuse re-verification — is covered by automated unit tests via dependency injection (`MemorySampling`, process identity verifier, signal sender, sleeper) on `.singleProcess` and `.processGroup` plans. The AppKit `NSRunningApplication` execution branches (`.gracefulApplication`, `.forceApplication`) are tested at the `CandidatePlanner` planning level only, and live system signal integration remains an operator responsibility.
+5. **Test discrimination covers policy and `.singleProcess`/`.processGroup` delivery mechanics via seams, excluding GUI `NSRunningApplication` execution.** The test suite verifies selection policy (ranking by `phys_footprint`, single-group-per-round action cap, mandatory name and ancestor/process-group protection) as well as signal-delivery mechanics (PID-reuse guard refusal, early `SIGKILL` on pressure drop, daemon-level `EnforceLock` exclusion), while AppKit GUI termination calls remain un-mocked.
 
 None of these are hidden behind configuration: in every case the tool prints the reason it declined to act (`action=reportOnly` / `action=protectedTarget` plus a `reason=` string) rather than staying silent.
 
@@ -192,9 +192,9 @@ The test target covers:
 It deliberately does **not** cover:
 
 - exact pressure-level boundaries (`available` *exactly equal to* a threshold, rather than just below it);
-- live kernel signal delivery against real OS workloads (tested via injectable seams instead).
+- live kernel signal delivery or AppKit `NSRunningApplication` termination against real OS workloads (`.singleProcess` and `.processGroup` delivery mechanics are tested via injectable seams instead).
 
-The test suite covers both **policy** (what gets selected) and **delivery mechanics** (how signals and grace-period re-checks are sequenced via injectable seams).
+The test suite covers **policy** (what gets selected) and **`.singleProcess`/`.processGroup` delivery mechanics** (how signals and grace-period re-checks are sequenced via injectable seams in `DarwinActionExecutor`).
 
 Run:
 

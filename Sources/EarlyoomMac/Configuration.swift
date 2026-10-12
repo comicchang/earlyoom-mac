@@ -8,6 +8,8 @@ public struct EarlyoomConfig: Equatable, Sendable {
     public var terminateAvailableFraction: Double
     public var killAvailableFraction: Double
     public var gracePeriodSeconds: Double
+    /// Steady-state heartbeat period in seconds. Configuration parsing requires `> 0`;
+    /// programmatic values `<= 0` disable periodic heartbeats in `determineReportCadence`.
     public var heartbeatSeconds: Double
     public var minimumCandidatePhysicalBytes: UInt64
     /// Exact case-insensitive process-name multipliers for badness ranking.
@@ -194,9 +196,9 @@ public struct EarlyoomConfig: Equatable, Sendable {
             }
         }
 
-        guard config.intervalSeconds > 0 else { throw EarlyoomError.invalidConfiguration("interval must be greater than zero") }
-        guard config.gracePeriodSeconds >= 0 else { throw EarlyoomError.invalidConfiguration("grace_period cannot be negative") }
-        guard config.heartbeatSeconds > 0 else { throw EarlyoomError.invalidConfiguration("heartbeat must be greater than zero") }
+        guard config.intervalSeconds > 0, config.intervalSeconds.isFinite else { throw EarlyoomError.invalidConfiguration("interval must be greater than zero") }
+        guard config.gracePeriodSeconds >= 0, config.gracePeriodSeconds.isFinite else { throw EarlyoomError.invalidConfiguration("grace_period cannot be negative") }
+        guard config.heartbeatSeconds > 0, config.heartbeatSeconds.isFinite else { throw EarlyoomError.invalidConfiguration("heartbeat must be greater than zero") }
         guard config.warnAvailableFraction > config.terminateAvailableFraction,
               config.terminateAvailableFraction > config.killAvailableFraction,
               config.killAvailableFraction >= 0,
@@ -229,18 +231,27 @@ public struct EarlyoomConfig: Equatable, Sendable {
         else if lower.hasSuffix("s") { multiplier = 1; number = lower.dropLast() }
         else if lower.hasSuffix("m") { multiplier = 60; number = lower.dropLast() }
         else { multiplier = 1; number = lower[lower.startIndex...] }
-        guard let parsed = Double(number), parsed >= 0 else {
+        guard let parsed = Double(number), parsed.isFinite, parsed >= 0 else {
             throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid duration")
         }
-        return parsed * multiplier
+        let duration = parsed * multiplier
+        guard duration.isFinite else {
+            throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid duration")
+        }
+        return duration
     }
 
     private static func parseFraction(_ value: String, _ line: Int) throws -> Double {
         let lower = value.lowercased()
-        if lower.hasSuffix("%"), let percentage = Double(lower.dropLast()) {
+        if lower.hasSuffix("%") {
+            guard let percentage = Double(lower.dropLast()), percentage.isFinite else {
+                throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid percentage")
+            }
             return percentage / 100
         }
-        guard let fraction = Double(lower) else { throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid percentage") }
+        guard let fraction = Double(lower), fraction.isFinite else {
+            throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid percentage")
+        }
         return fraction
     }
 
@@ -250,7 +261,9 @@ public struct EarlyoomConfig: Equatable, Sendable {
         for (suffix, multiplier) in suffixes where lower.hasSuffix(suffix) {
             let number = lower.dropLast(suffix.count).trimmingCharacters(in: .whitespaces)
             guard let parsed = Double(number), parsed > 0, parsed.isFinite else { break }
-            return UInt64(parsed * Double(multiplier))
+            let product = parsed * Double(multiplier)
+            guard product.isFinite, product < Double(UInt64.max) else { break }
+            return UInt64(product)
         }
         throw EarlyoomError.invalidConfiguration("line \(line + 1): invalid byte size")
     }

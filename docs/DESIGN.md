@@ -15,7 +15,7 @@ It is not a kernel OOM replacement, a memory “cleaner,” a hard per-process m
 
 ```text
 DarwinMemorySampler ─┐
-                     ├─ EarlyoomDaemon ─ CandidatePlanner ─ ActionExecutor
+                     ├─ EarlyoomDaemon ─ CandidatePlanner ─ ProcessActionExecutor
 DarwinProcessSampler ┘         │                 │               ├─ DryRun (default)
                                │                 │               └─ Darwin signals/AppKit (explicit)
                                └─ report (phys_footprint + RSS side by side)
@@ -23,8 +23,8 @@ DarwinProcessSampler ┘         │                 │               ├─ Dr
 
 - `DarwinProcessSampler` uses `libproc` (`proc_listallpids`, `proc_pidinfo`) and `proc_pid_rusage(..., RUSAGE_INFO_V4, ...)`. The decision metric is `ri_phys_footprint`; RSS is displayed only as a diagnostic comparison.
 - `DarwinMemorySampler` reads `hw.memsize`, `host_statistics64`, and `vm.swapusage`. Available memory is the reclaimable free + inactive + purgeable pool; compressor pages are **not** counted as free.
-- `CandidatePlanner` applies suppression before ranking and aggregates a GUI application's helpers by bundle identity. Non-GUI processes are grouped by process group when a valid PGID exists.
-- `ActionExecutor` is an injectable seam. The CLI selects `DryRunActionExecutor` unless the configuration explicitly sets both `enabled = true` and `report_only = false`.
+- `CandidatePlanner` applies suppression before ranking, aggregates a GUI application's helpers by outermost bundle identity, and assigns an executable action plan to at most the single highest-badness eligible group per round (deferring lower-ranked eligible groups as `reportOnly` until the next sample). Non-GUI processes are grouped by process group when a valid PGID exists.
+- `ProcessActionExecutor` is an injectable seam. The CLI selects `DryRunActionExecutor` unless the configuration explicitly sets both `enabled = true` and `report_only = false`, in which case it selects `DarwinActionExecutor`.
 
 ## Metric and badness
 
@@ -107,7 +107,7 @@ When running as UID 0 without a reliable console-session identity, the policy co
 
 For each PID, the sampler obtains the resolved executable path with `proc_pidpath`. `BundleIdentityResolver`:
 
-1. finds the containing `.app` component in the path;
+1. finds the outermost containing `.app` component in the path (`firstIndex`, so nested `Contents/Frameworks/*Helper*.app` bundles resolve to the main application);
 2. opens that bundle's `Info.plist` through `Bundle(path:)`;
 3. requires a non-empty `CFBundleIdentifier`;
 4. records both the bundle identifier and canonical app path.
@@ -194,6 +194,6 @@ middle-ground behaviour nobody chose.
 9. **The default suppression set covers the processes you most want to act on.** `protect_current_user = true` and `protect_current_session = true` mean a freshly installed instance reports essentially every workload that matters on a desktop — the agent, the browser, the VM, the build — and acts on none of them, because they all run as the current user in the current session. This is not an oversight that a better heuristic would fix: at sample time the tool can see a footprint and a name, and nothing that distinguishes "this is my long-running project" from "this is a runaway". The policy chooses to protect both. Turning it off is the only way to reach these workloads, and that is a decision an operator has to make explicitly after reading reports.
 10. **`gui_escalation = never` makes every GUI application permanently report-only.** `CandidatePlanner.actionSafety` maps a verified app bundle to `reportOnly` on this value before considering any other rule, so no configuration short of setting this key acts on a `.app`. Because the default is the most conservative rung of a four-rung ladder whose higher rungs can each lose unsaved work or take out a login session, this is intended — but it does mean the shipped default has no GUI enforcement capability at all, and readers should not infer one from the existence of the escalation options.
 11. **Multi-member workloads are refused rather than partially handled.** See ["Why refuse the group"](#why-refuse-the-group-instead-of-pick-its-biggest-member). Under the defaults this creates a size-independent eligibility cliff at "two members above `minimum_candidate` in one group", not at "a large number of bytes".
-12. **`DarwinActionExecutor` has no automated test coverage.** The executor is excluded from the test target: no test constructs one, and no test exercises `SIGTERM`/`SIGKILL` delivery, the `NSRunningApplication` graceful-then-force path, the process-group gate, or the PID-reuse re-verification. Everything above the executor — parsing, suppression, grouping, ranking, plan selection, and the daemon's report-only seam — is covered. The practical effect is that the project's test suite can prove *which* action would be taken, and cannot prove *how* it would be delivered. This is the single highest-value thing to fix before anyone relies on enforcement in production; see [`DECISIONS.md`](DECISIONS.md) for the mutation evidence that demonstrates the gap rather than merely asserting it.
+12. **`DarwinActionExecutor` covers `.singleProcess` and `.processGroup` via injectable seams, but GUI `NSRunningApplication` execution and live OS signals have no automated test coverage.** `EarlyoomMacTests` injects `MemorySampling`, `pidVerifier`, `signalSender`, and `sleeper` into `DarwinActionExecutor` to verify `.singleProcess` and `.processGroup` `SIGTERM`→`SIGKILL` escalation, grace-period early `SIGKILL` when available memory is at or drops to `kill_available`, `grace_period = 0s`, grace-period sampling error fallback, partial process-group exit with surviving culprit `SIGKILL`, and PID-reuse refusal/per-member fallback. However, the AppKit `NSRunningApplication` execution branches (`.gracefulApplication` and `.forceApplication`) and live un-mocked kernel signal delivery remain untested by unit tests; see [`DECISIONS.md`](DECISIONS.md) §3.3 for the exact coverage boundary.
 13. **Threshold boundaries are untested.** `PressureLevel` uses `<=` against each configured fraction, so a sample landing exactly on `warn_available` or `kill_available` is classified as that level. No test pins that inclusive behaviour, and no test covers the ordering of the three comparisons beyond values clearly below each boundary. Changing `<=` to `<` today would leave the suite green.
-14. **Test discrimination is asymmetric.** Spot mutation checks confirm that the suite fails when badness ranking is switched from `phys_footprint` to RSS, and when the mandatory suppression names stop being unioned into the configured list — both safety-critical, both caught. The same method shows that disabling the executor's PID-reuse guard outright leaves the suite green. Read the suite as a strong regression net for policy, and as no net at all for delivery mechanics.
+14. **Test discrimination covers policy plus `.singleProcess`/`.processGroup` delivery seams, but not GUI `NSRunningApplication` delivery.** Spot mutation checks confirm that the suite fails when badness ranking is switched from `phys_footprint` to RSS, when mandatory suppression names stop being unioned into the configured list, when `EarlyoomDaemon` skips `EnforceLock.acquire()`, or when `DarwinActionExecutor`'s PID-reuse guard is disabled on `.singleProcess` or `.processGroup` paths. The AppKit `NSRunningApplication` execution paths remain covered only at the `CandidatePlanner` decision-table level.

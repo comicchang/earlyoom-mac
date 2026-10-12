@@ -13,7 +13,7 @@ public struct BundleIdentityResolver: ApplicationIdentityResolving, Sendable {
     public func resolve(executablePath: String) -> ApplicationIdentity? {
         let standardized = URL(fileURLWithPath: executablePath).standardizedFileURL.path
         let components = standardized.split(separator: "/", omittingEmptySubsequences: true).map(String.init)
-        guard let appIndex = components.lastIndex(where: { $0.hasSuffix(".app") }) else { return nil }
+        guard let appIndex = components.firstIndex(where: { $0.hasSuffix(".app") }) else { return nil }
         let rootComponents = Array(components.prefix(appIndex + 1))
         let appPath = "/" + rootComponents.joined(separator: "/")
         guard let bundle = Bundle(path: appPath),

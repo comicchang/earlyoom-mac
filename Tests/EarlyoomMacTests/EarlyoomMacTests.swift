@@ -64,6 +64,18 @@ func configurationRejectsUnsafeTypos() {
     #expect(throws: EarlyoomError.self) {
         try EarlyoomConfig.parse(text: "[check]\nmetric = rss\n")
     }
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[earlyoom]\ninterval = infs\n")
+    }
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[earlyoom]\ngrace_period = nan\n")
+    }
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[check]\nwarn_available = inf%\n")
+    }
+    #expect(throws: EarlyoomError.self) {
+        try EarlyoomConfig.parse(text: "[check]\nterminate_available = nan\n")
+    }
 }
 
 @Test("physical footprint wins over a 2500x RSS divergence")
@@ -82,6 +94,50 @@ func footprintVsRSSRegression() {
     #expect(result.groups.first?.residentBytes == pathological.residentBytes)
     #expect((result.groups.first?.badness ?? 0) > (result.groups.last?.badness ?? 1))
     #expect(result.plans.first?.safety == .singleProcess)
+    #expect(result.plans.last?.safety == .reportOnly)
+}
+
+@Test("planner and daemon cap actions to a single highest-badness group per round")
+func singleGroupPerRoundCap() throws {
+    var config = permissiveEnforcementConfig()
+    config.guiEscalation = .never
+    let policy = SuppressionPolicy(config: config, currentUID: 501, currentSessionID: nil, daemonPID: 7)
+    let protectedTop = process(pid: 100, name: "WindowServer", uid: 0, footprint: 10 * gib, rss: gib)
+    let firstEligible = process(pid: 200, name: "worker-1", footprint: 6 * gib, rss: gib)
+    let secondEligible = process(pid: 201, name: "worker-2", footprint: 4 * gib, rss: gib)
+    let thirdEligible = process(pid: 202, name: "worker-3", footprint: 2 * gib, rss: gib)
+    let memory = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 256 * mib)
+
+    let result = CandidatePlanner(config: config, policy: policy).plan(
+        memory: memory,
+        processes: [thirdEligible, protectedTop, secondEligible, firstEligible]
+    )
+    #expect(result.plans.count == 4)
+    #expect(result.plans[0].group.representative.pid == 100)
+    #expect(result.plans[0].safety == .protectedTarget)
+    #expect(result.plans[1].group.representative.pid == 200)
+    #expect(result.plans[1].safety == .singleProcess)
+    #expect(result.plans[2].group.representative.pid == 201)
+    #expect(result.plans[2].safety == .reportOnly)
+    #expect(result.plans[2].reason.contains("deferred to higher-badness candidate"))
+    #expect(result.plans[3].group.representative.pid == 202)
+    #expect(result.plans[3].safety == .reportOnly)
+
+    let executor = MockActionExecutor(outcome: ActionExecutionOutcome(state: .executed, reason: "delivered"))
+    let daemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [thirdEligible, protectedTop, secondEligible, firstEligible]),
+        memorySampler: FixedMemorySampler(value: memory),
+        actionExecutor: executor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("cap-lock-\(UUID().uuidString)"),
+        output: { _ in }
+    )
+    try daemon.run(repeatCount: 1)
+    #expect(executor.executedPlans.count == 1)
+    #expect(executor.executedPlans.first?.group.representative.pid == 200)
 }
 
 @Test("criticality weight multiplies physical-footprint badness")
@@ -127,6 +183,26 @@ func currentSessionProtection() {
     #expect(policy.reason(for: currentSession, allProcesses: [currentSession]) == "current login session")
 }
 
+@Test("process-group protection includes daemon ancestors and descendants")
+func processGroupProtectsDaemonRelatives() {
+    var config = EarlyoomConfig.safeReportOnly
+    config.protectCurrentUser = false
+    config.protectCurrentSession = false
+    config.protectAncestors = true
+    config.protectProcessGroups = true
+    let policy = SuppressionPolicy(config: config, currentUID: 501, currentSessionID: nil, daemonPID: 700)
+
+    let parentShell = process(pid: 600, name: "custom-launcher", uid: 501, pgid: 600, footprint: 10 * mib, rss: 5 * mib, parent: 1)
+    let daemonProc = process(pid: 700, name: "earlyoom-mac", uid: 501, pgid: 700, footprint: 10 * mib, rss: 5 * mib, parent: 600)
+    let daemonChild = process(pid: 701, name: "probe-helper", uid: 501, pgid: 701, footprint: 10 * mib, rss: 5 * mib, parent: 700)
+    let siblingWorker = process(pid: 601, name: "worker", uid: 501, pgid: 600, footprint: 4 * gib, rss: gib, parent: 600)
+    let all = [parentShell, daemonProc, daemonChild, siblingWorker]
+
+    #expect(policy.reason(for: parentShell, allProcesses: all) == "earlyoom-mac ancestor or descendant")
+    #expect(policy.reason(for: daemonChild, allProcesses: all) == "earlyoom-mac ancestor or descendant")
+    #expect(policy.reason(for: siblingWorker, allProcesses: all) == "process group contains a protected session process")
+}
+
 @Test("root daemon refuses to guess a user's console session")
 func rootDaemonProtectsNonRootUsers() {
     var config = EarlyoomConfig.safeReportOnly
@@ -150,6 +226,11 @@ func bundleIdentityResolution() throws {
     let identity = BundleIdentityResolver().resolve(executablePath: executable.path)
     #expect(identity?.bundleIdentifier == "org.example.Editor")
     #expect(identity?.applicationPath == root.path)
+
+    let nestedHelper = root.appendingPathComponent("Contents/Frameworks/Editor Helper (Renderer).app/Contents/MacOS/Editor Helper (Renderer)")
+    let nestedIdentity = BundleIdentityResolver().resolve(executablePath: nestedHelper.path)
+    #expect(nestedIdentity?.bundleIdentifier == "org.example.Editor")
+    #expect(nestedIdentity?.applicationPath == root.path)
 }
 
 @Test("GUI policy maps to graceful, force, or process-group stages")
@@ -328,13 +409,13 @@ func heartbeatConfiguration() throws {
     }
 }
 
-@Test("report cadence decision table covers full, heartbeat, and silent modes")
+@Test("report cadence decision table covers full, heartbeat, and silent modes across all four pressure levels")
 func reportCadenceDecisionTable() {
     // First run is always full
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: true,
-        previousBand: nil,
-        currentBand: .ok,
+        previousPressure: nil,
+        currentPressure: .normal,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 0,
         heartbeatSeconds: 300
@@ -343,26 +424,42 @@ func reportCadenceDecisionTable() {
     // Steady state without change is silent
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .ok,
-        currentBand: .ok,
+        previousPressure: .normal,
+        currentPressure: .normal,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 50,
         heartbeatSeconds: 300
     ) == .silent)
 
-    // Band change triggers full report
+    // Pressure level changes trigger full report (including terminate <-> kill)
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .ok,
-        currentBand: .warn,
+        previousPressure: .normal,
+        currentPressure: .warn,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 50,
         heartbeatSeconds: 300
     ) == .full)
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .warn,
-        currentBand: .action,
+        previousPressure: .warn,
+        currentPressure: .terminate,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 10,
+        heartbeatSeconds: 300
+    ) == .full)
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousPressure: .terminate,
+        currentPressure: .kill,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 10,
+        heartbeatSeconds: 300
+    ) == .full)
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousPressure: .kill,
+        currentPressure: .terminate,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 10,
         heartbeatSeconds: 300
@@ -371,8 +468,8 @@ func reportCadenceDecisionTable() {
     // Action outcomes (executed, attempted, or rejected) trigger full report
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .action,
-        currentBand: .action,
+        previousPressure: .terminate,
+        currentPressure: .terminate,
         hasActionOutcomes: true,
         elapsedSinceLastOutput: 2,
         heartbeatSeconds: 300
@@ -381,26 +478,36 @@ func reportCadenceDecisionTable() {
     // Heartbeat elapsed triggers heartbeat line
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .ok,
-        currentBand: .ok,
+        previousPressure: .normal,
+        currentPressure: .normal,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 300,
         heartbeatSeconds: 300
     ) == .heartbeat)
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .ok,
-        currentBand: .ok,
+        previousPressure: .normal,
+        currentPressure: .normal,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 350,
         heartbeatSeconds: 300
     ) == .heartbeat)
 
+    // Non-positive heartbeatSeconds disables periodic heartbeat programmatically
+    #expect(EarlyoomDaemon.determineReportCadence(
+        isFirstRun: false,
+        previousPressure: .normal,
+        currentPressure: .normal,
+        hasActionOutcomes: false,
+        elapsedSinceLastOutput: 500,
+        heartbeatSeconds: 0
+    ) == .silent)
+
     // --once mode is always full
     #expect(EarlyoomDaemon.determineReportCadence(
         isFirstRun: false,
-        previousBand: .ok,
-        currentBand: .ok,
+        previousPressure: .normal,
+        currentPressure: .normal,
         hasActionOutcomes: false,
         elapsedSinceLastOutput: 10,
         heartbeatSeconds: 300,
@@ -464,6 +571,16 @@ func daemonCadenceInSteadyState() throws {
     #expect(logs[1].contains("available="))
     #expect(logs[1].contains("top="))
     #expect(logs[1].contains("actions="))
+
+    // Empty candidate groups in heartbeat emits top=none badness=0.000
+    let emptyHeartbeat = EarlyoomDaemon.formatHeartbeat(
+        memory: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 12 * gib),
+        result: PlanningResult(pressure: .normal, availableFraction: 0.75, groups: [], plans: []),
+        enabled: false,
+        reportOnly: true,
+        cumulativeActions: 0
+    )
+    #expect(emptyHeartbeat.contains("top=none badness=0.000 actions=0"))
 }
 
 @Test("daemon loop skips round on sampling failure and logs error to stderr")
@@ -500,9 +617,60 @@ func daemonSamplingFailureSkipsRound() throws {
     #expect(throws: EarlyoomError.self) {
         try onceDaemon.run(repeatCount: 1)
     }
+    // Action execution error (e.g. EPERM) is logged in daemon mode without crashing, but thrown in --once mode
+    final class ThrowingExecutor: ProcessActionExecutor, @unchecked Sendable {
+        var calls = 0
+        func execute(_ plan: ActionPlan, gracePeriodSeconds: Double) throws {
+            calls += 1
+            throw EarlyoomError.cannotReadProcess(plan.group.representative.pid, "Operation not permitted")
+        }
+        func executeWithOutcome(_ plan: ActionPlan, gracePeriodSeconds: Double) throws -> ActionExecutionOutcome {
+            calls += 1
+            throw EarlyoomError.cannotReadProcess(plan.group.representative.pid, "Operation not permitted")
+        }
+    }
+
+    var enforceConfig = permissiveEnforcementConfig()
+    enforceConfig.intervalSeconds = 1
+    let actionErrorBox = LockedBox<[String]>([])
+    let throwingExecutor = ThrowingExecutor()
+    let resilientDaemon = EarlyoomDaemon(
+        config: enforceConfig,
+        processSampler: FixedProcessSampler(values: [process(pid: 88, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 256 * mib)),
+        actionExecutor: throwingExecutor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("err-lock-\(UUID().uuidString)"),
+        output: { _ in },
+        errorOutput: { err in actionErrorBox.withValue { $0.append(err) } },
+        sleeper: { _ in }
+    )
+    try resilientDaemon.run(repeatCount: 2)
+    #expect(throwingExecutor.calls == 2)
+    #expect(actionErrorBox.current.count == 2)
+    #expect(actionErrorBox.current[0].contains("[error] action execution failed:"))
+
+    let onceThrowingDaemon = EarlyoomDaemon(
+        config: enforceConfig,
+        processSampler: FixedProcessSampler(values: [process(pid: 88, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 256 * mib)),
+        actionExecutor: ThrowingExecutor(),
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("once-err-lock-\(UUID().uuidString)"),
+        output: { _ in },
+        errorOutput: { _ in },
+        sleeper: { _ in }
+    )
+    #expect(throws: EarlyoomError.self) {
+        try onceThrowingDaemon.run(repeatCount: 1)
+    }
 }
 
-@Test("enforce mode single-instance lock prevents concurrent execution")
+@Test("enforce mode single-instance lock prevents concurrent execution at lock and daemon levels")
 func enforceLockSingleInstanceMutex() throws {
     let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent("earlyoom-lock-test-\(UUID().uuidString)")
     try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
@@ -521,22 +689,41 @@ func enforceLockSingleInstanceMutex() throws {
     #expect(lock1.isHeld == true)
 
     let lock2 = EnforceLock(url: lockURL)
-    #expect(throws: EarlyoomError.self) {
+    do {
         try lock2.acquire()
+        Issue.record("expected EnforceLock.acquire() to throw .lockAlreadyHeld")
+    } catch EarlyoomError.lockAlreadyHeld {
+        // expected
+    }
+
+    // Daemon-level enforce lock contention must also throw .lockAlreadyHeld
+    let contendingDaemon = EarlyoomDaemon(
+        config: permissiveEnforcementConfig(),
+        processSampler: FixedProcessSampler(values: []),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 12 * gib)),
+        actionExecutor: RecordingExecutor(),
+        lockURL: lockURL,
+        output: { _ in }
+    )
+    do {
+        try contendingDaemon.runOnce()
+        Issue.record("expected contending EarlyoomDaemon.runOnce() to throw .lockAlreadyHeld")
+    } catch EarlyoomError.lockAlreadyHeld {
+        // expected
     }
 
     lock1.release()
     #expect(lock1.isHeld == false)
-    try lock2.acquire()
-    #expect(lock2.isHeld == true)
-    lock2.release()
+    let postReleaseResult = try contendingDaemon.runOnce()
+    #expect(postReleaseResult.pressure == .normal)
+    #expect(contendingDaemon.enforceLock?.isHeld == false)
 }
 
 @Test("DarwinActionExecutor performs early SIGKILL when memory pressure drops below kill threshold during grace period")
 func gracePeriodEarlyKillOnPressureDrop() throws {
     let mem1 = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(1.6 * Double(gib)))
     let mem2 = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(0.64 * Double(gib)))
-    let dynamicMemorySampler = MutableMemorySampler(snapshots: [mem1, mem2])
+    let dynamicMemorySampler = MutableMemorySampler(snapshots: [mem1, mem1, mem2])
 
     let signalBox = LockedBox<[SignalRecord]>([])
     let mockSender: @Sendable (Int32, Int32) -> Int32 = { pid, sig in
@@ -589,6 +776,60 @@ func gracePeriodEarlyKillOnPressureDrop() throws {
     let sleepDurations = sleepBox.current
     #expect(sleepDurations.count == 2)
     #expect(sleepDurations.reduce(0, +) == 2.0)
+
+    // Already at .kill pressure at grace entry: must not sleep 1s before escalating to SIGKILL
+    let immediateSleepBox = LockedBox<[Double]>([])
+    let immediateExecutor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem2),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { duration in immediateSleepBox.withValue { $0.append(duration) } },
+        pidVerifier: { _, _ in true },
+        signalSender: { _, _ in 0 }
+    )
+    _ = try immediateExecutor.executeWithOutcome(plan, gracePeriodSeconds: 10.0)
+    #expect(immediateSleepBox.current.isEmpty)
+
+    // gracePeriodSeconds == 0: immediate SIGTERM -> SIGKILL without sleeping
+    let zeroGraceSleepBox = LockedBox<[Double]>([])
+    let zeroGraceSignals = LockedBox<[SignalRecord]>([])
+    let zeroGraceExecutor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem1),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { duration in zeroGraceSleepBox.withValue { $0.append(duration) } },
+        pidVerifier: { _, _ in true },
+        signalSender: { pid, sig in
+            zeroGraceSignals.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            return 0
+        }
+    )
+    let zeroOutcome = try zeroGraceExecutor.executeWithOutcome(plan, gracePeriodSeconds: 0.0)
+    #expect(zeroOutcome.state == .executed)
+    #expect(zeroGraceSleepBox.current.isEmpty)
+    #expect(zeroGraceSignals.current.filter { $0.sig != 0 } == [
+        SignalRecord(pid: 7777, sig: SIGTERM),
+        SignalRecord(pid: 7777, sig: SIGKILL)
+    ])
+
+    // Grace-period memory sampling failure falls back to waiting full gracePeriodSeconds
+    struct AlwaysFailingMemorySampler: MemorySampling {
+        func sample() throws -> MemorySnapshot {
+            throw EarlyoomError.cannotReadMemory("transient mach failure")
+        }
+    }
+    let fallbackSleepBox = LockedBox<[Double]>([])
+    let fallbackExecutor = DarwinActionExecutor(
+        memorySampler: AlwaysFailingMemorySampler(),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { duration in fallbackSleepBox.withValue { $0.append(duration) } },
+        pidVerifier: { _, _ in true },
+        signalSender: { _, _ in 0 }
+    )
+    let fallbackOutcome = try fallbackExecutor.executeWithOutcome(plan, gracePeriodSeconds: 3.0)
+    #expect(fallbackOutcome.state == .executed)
+    #expect(fallbackSleepBox.current == [1.0, 1.0, 1.0])
 }
 
 @Test("DarwinActionExecutor respects PID reuse guard before delivering SIGKILL")
@@ -667,6 +908,133 @@ func gracePeriodPIDReuseGuard() throws {
     #expect(nonZeroVerified == [SignalRecord(pid: 8888, sig: SIGTERM), SignalRecord(pid: 8888, sig: SIGKILL)])
 }
 
+@Test("DarwinActionExecutor processGroup escalates surviving culprit after partial exit and guards against PID reuse")
+func processGroupPartialExitAndPIDReuseGuard() throws {
+    let mem = MemorySnapshot(physicalBytes: 16 * gib, availableBytes: UInt64(1.6 * Double(gib)))
+    let helper = ProcessSnapshot(
+        pid: 5000,
+        parentPID: 1,
+        processGroupID: 5000,
+        sessionID: 10,
+        userID: 501,
+        name: "helper",
+        physicalBytes: 2 * gib,
+        residentBytes: gib,
+        startTimeSeconds: 1000
+    )
+    let culprit = ProcessSnapshot(
+        pid: 5001,
+        parentPID: 5000,
+        processGroupID: 5000,
+        sessionID: 10,
+        userID: 501,
+        name: "culprit",
+        physicalBytes: 8 * gib,
+        residentBytes: 4 * gib,
+        startTimeSeconds: 1001
+    )
+    let group = CandidateGroup(
+        key: "process-group:5000",
+        representative: culprit,
+        members: [culprit, helper],
+        physicalBytes: 10 * gib,
+        residentBytes: 5 * gib,
+        application: nil,
+        badness: 0.625,
+        safety: .processGroup
+    )
+    let plan = ActionPlan(group: group, safety: .processGroup, reason: "terminate process group")
+
+    // Case 1: Helper (5000) exits after SIGTERM; culprit (5001) survives and must still receive SIGKILL.
+    let termSentBox = LockedBox(false)
+    let case1Signals = LockedBox<[SignalRecord]>([])
+    let case1Executor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { _ in },
+        pidVerifier: { pid, _ in
+            if pid == 5000 && termSentBox.current {
+                return false // helper exited during grace period, so proc_pidinfo fails
+            }
+            return true
+        },
+        signalSender: { pid, sig in
+            case1Signals.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            if pid == -5000 && sig == SIGTERM {
+                termSentBox.withValue { $0 = true }
+                return 0
+            }
+            if pid == 5000 && sig == 0 && termSentBox.current {
+                errno = ESRCH
+                return -1
+            }
+            return 0
+        }
+    )
+    let case1Outcome = try case1Executor.executeWithOutcome(plan, gracePeriodSeconds: 2.0)
+    #expect(case1Outcome.state == .executed)
+    #expect(case1Signals.current.filter { $0.sig != 0 } == [
+        SignalRecord(pid: -5000, sig: SIGTERM),
+        SignalRecord(pid: -5000, sig: SIGKILL)
+    ])
+
+    // Case 2: Helper (5000) exits and its PID is reused by a new live process; culprit (5001) survives.
+    // Group SIGKILL (-5000) and reused PID (5000) must be refused; verified survivor (5001) receives per-PID SIGKILL.
+    let case2TermSent = LockedBox(false)
+    let case2Signals = LockedBox<[SignalRecord]>([])
+    let case2Executor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { _ in },
+        pidVerifier: { pid, _ in
+            if pid == 5000 && case2TermSent.current {
+                return false // PID 5000 is alive but belongs to a new process with a different start time
+            }
+            return true
+        },
+        signalSender: { pid, sig in
+            case2Signals.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            if pid == -5000 && sig == SIGTERM {
+                case2TermSent.withValue { $0 = true }
+            }
+            return 0
+        }
+    )
+    let case2Outcome = try case2Executor.executeWithOutcome(plan, gracePeriodSeconds: 2.0)
+    #expect(case2Outcome.state == .executed)
+    #expect(case2Signals.current.filter { $0.sig != 0 } == [
+        SignalRecord(pid: -5000, sig: SIGTERM),
+        SignalRecord(pid: 5001, sig: SIGKILL)
+    ])
+
+    // Case 3: All alive members have reused PIDs before SIGKILL -> no SIGKILL is sent at all.
+    let case3TermSent = LockedBox(false)
+    let case3Signals = LockedBox<[SignalRecord]>([])
+    let case3Executor = DarwinActionExecutor(
+        memorySampler: FixedMemorySampler(value: mem),
+        killAvailableFraction: 0.05,
+        gracePollSeconds: 1.0,
+        sleeper: { _ in },
+        pidVerifier: { _, _ in
+            !case3TermSent.current
+        },
+        signalSender: { pid, sig in
+            case3Signals.withValue { $0.append(SignalRecord(pid: pid, sig: sig)) }
+            if pid == -5000 && sig == SIGTERM {
+                case3TermSent.withValue { $0 = true }
+            }
+            return 0
+        }
+    )
+    let case3Outcome = try case3Executor.executeWithOutcome(plan, gracePeriodSeconds: 2.0)
+    #expect(case3Outcome.state == .executed)
+    #expect(case3Signals.current.filter { $0.sig != 0 } == [
+        SignalRecord(pid: -5000, sig: SIGTERM)
+    ])
+}
+
 @Test("daemon fast resamples within 1s after executing an action")
 func daemonFastResampleAfterAction() throws {
     let sleepBox = LockedBox<[Double]>([])
@@ -718,4 +1086,41 @@ func daemonFastResampleAfterAction() throws {
     let idleSleeps = sleepBox.current
     #expect(idleSleeps.count == 1)
     #expect(idleSleeps[0] == 5.0)
+
+    // .attempted does not trigger fast resample
+    sleepBox.withValue { $0.removeAll() }
+    let attemptedExecutor = MockActionExecutor(outcome: ActionExecutionOutcome(state: .attempted, reason: "target exited before signal"))
+    let attemptedDaemon = EarlyoomDaemon(
+        config: config,
+        processSampler: FixedProcessSampler(values: [process(pid: 44, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 128 * mib)),
+        actionExecutor: attemptedExecutor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("lock-\(UUID().uuidString)"),
+        output: { _ in },
+        sleeper: mockSleeper
+    )
+    try attemptedDaemon.run(repeatCount: 2)
+    #expect(sleepBox.current == [5.0])
+
+    // Sub-second intervalSeconds (< 1.0) preserves configured interval after action
+    sleepBox.withValue { $0.removeAll() }
+    var subSecondConfig = config
+    subSecondConfig.intervalSeconds = 0.2
+    let subSecondDaemon = EarlyoomDaemon(
+        config: subSecondConfig,
+        processSampler: FixedProcessSampler(values: [process(pid: 44, footprint: 8 * gib, rss: mib)]),
+        memorySampler: FixedMemorySampler(value: MemorySnapshot(physicalBytes: 16 * gib, availableBytes: 128 * mib)),
+        actionExecutor: actingExecutor,
+        currentUID: 501,
+        currentSessionID: nil,
+        daemonPID: 7,
+        lockURL: FileManager.default.temporaryDirectory.appendingPathComponent("lock-\(UUID().uuidString)"),
+        output: { _ in },
+        sleeper: mockSleeper
+    )
+    try subSecondDaemon.run(repeatCount: 2)
+    #expect(sleepBox.current == [0.2])
 }

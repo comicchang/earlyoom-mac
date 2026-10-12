@@ -189,22 +189,24 @@ only what it can compute.
 *Context.* A parallel daemon (`memguard`) developed by the same author on this machine underwent
 multiple production hardening iterations following empirical 2026-10-08/09 memory exhaustion
 incidents. Five operational semantics were proven necessary:
-1. **Three-tier report cadence**: full report on initial run, pressure band transition
-   (`ok ↔ warn ↔ action`), or action execution; single-line heartbeat summary after `heartbeat`
-   duration; zero output during steady state. This prevents 100+ MB/day log growth into launchd
-   `StandardOutPath`.
-2. **Fail-closed sampling failure handling**: transient sampling errors in daemon mode log a single
-   line to stderr and skip the round (no action, no misreport) instead of crashing the daemon,
-   while single-shot `--once` mode preserves throwing exit semantics.
-3. **Enforce-mode single-instance mutex**: acquiring a non-blocking BSD `flock` on
-   `~/.cache/earlyoom-mac/enforce.lock` before executing enforce mode, preventing two concurrent
-   daemons from dispatching duplicate signals.
-4. **Grace-period pressure re-evaluation**: during SIGTERM grace period, re-evaluating global
-   pressure every ~1s; if available memory drops to or below `kill_available`, SIGKILL is sent
-   immediately without waiting out the full grace period (PID start-time identity verification intact).
-5. **Fast resample after action**: resampling immediately (≤1s) following an action rather than waiting
-   a full interval.
-
+1. **Three-tier report cadence**: full report on initial run, four-level `PressureLevel` transition
+   (`normal ↔ warn ↔ terminate ↔ kill`), or action execution; single-line heartbeat summary after
+   `heartbeat` duration; zero output during steady state. This prevents 100+ MB/day log growth into
+   launchd `StandardOutPath`.
+2. **Fail-closed sampling and action failure handling**: transient sampling errors or signal-delivery
+   failures (such as `EPERM`) in resident daemon mode log to stderr and continue to the next round
+   instead of crashing the daemon into a launchd `KeepAlive` restart loop, while single-shot `--once`
+   mode preserves throwing exit semantics.
+3. **Enforce-mode single-instance mutex**: acquiring a non-blocking BSD `flock` (opened with `O_CLOEXEC`)
+   on `~/.cache/earlyoom-mac/enforce.lock` before executing enforce mode, preventing two concurrent
+   daemons from dispatching duplicate signals or leaking lock descriptors across child processes.
+4. **Grace-period pressure re-evaluation**: checking global pressure before each ~1s grace-period sleep;
+   if available memory is already at or drops to `kill_available`, `SIGKILL` is sent immediately without
+   waiting out the full grace period (with surviving-member PID + start-time identity verification intact).
+5. **Single-group-per-round action cap and fast resample**: acting on at most the single highest-badness
+   eligible candidate group per sampling round (`CandidatePlanner` marks only the top eligible group
+   actionable and `EarlyoomDaemon` breaks after the first `.executed` outcome), then resampling within
+   `min(1s, interval)` before acting on any remaining candidates.
 *Decision.* Port these five semantics into `earlyoom-mac` clean-room in Swift 6. No GPL code is
 introduced; this port originates from the author's companion implementation.
 
@@ -276,21 +278,24 @@ Each mutation was applied, the suite run, and the change reverted:
 | --- | --- |
 | badness computed from `residentBytes` instead of `physicalBytes` | **caught** — 2 tests fail |
 | mandatory names no longer unioned into the configured list | **caught** — 1 test fails |
-| `DarwinActionExecutor.isSameProcess` forced to return `true` (PID-reuse guard disabled) | **survived** — all tests pass |
+| `DarwinActionExecutor.isSameProcess` forced to return `true` (PID-reuse guard disabled) | **caught** — `gracePeriodPIDReuseGuard` and `processGroupPartialExitAndPIDReuseGuard` fail (originally **survived** in the 2026-10-03 pass before `5dd99bf` added injectable executor seams) |
+| `EarlyoomDaemon` skipping `enforceLock?.acquire()` | **caught** — `enforceLockSingleInstanceMutex` fails on daemon-level contention |
 
-The third row is the important one. It is the empirical form of the executor coverage gap:
-the PID-reuse protection is a real safety mechanism, and the suite would not notice if it
-were deleted outright. It also means the passing suite should never be cited as evidence
-that signal delivery is correct.
+While `5dd99bf` and subsequent hardening closed the seam gap for `.singleProcess` and `.processGroup`
+signal delivery (including partial group exit escalation and PID-reuse degradation), the AppKit
+`NSRunningApplication` GUI execution branches (`.gracefulApplication` and `.forceApplication`) still do
+not have an injectable seam and remain tested only at the `CandidatePlanner` decision-table level.
 
 ---
 
 ## 4. Open items, in priority order
 
-1. **Test `DarwinActionExecutor`.** [Resolved 2026-10-12] Dependencies (`MemorySampling`,
-   PID verifier, signal sender, sleeper) were made injectable in `DarwinActionExecutor`.
-   Automated tests in `EarlyoomMacTests` now verify grace-period early SIGKILL, PID-reuse
-   refusal, and signal delivery mechanics without sending real destructive signals to the OS.
+1. **Test `DarwinActionExecutor` GUI (`NSRunningApplication`) branches.** [Partially resolved 2026-10-12]
+   Dependencies (`MemorySampling`, PID verifier, signal sender, sleeper) were made injectable in
+   `DarwinActionExecutor`, and automated tests in `EarlyoomMacTests` now cover `.singleProcess` and
+   `.processGroup` signal delivery, grace-period early `SIGKILL`, `grace_period = 0s`, sampling error
+   fallback, and PID-reuse refusal without sending live OS signals. Extracting a protocol seam for
+   `NSRunningApplication` to unit-test `.gracefulApplication` and `.forceApplication` delivery remains open.
 2. **Decide what to do about the multi-member refusal (D-7).** Either document-only (current
    state), or add an explicit opt-in that terminates the *largest member* under a separate
    configuration key with a name that cannot be confused with whole-group termination.

@@ -71,14 +71,26 @@ public struct CandidatePlanner: Sendable {
             if $0.badness != $1.badness { return $0.badness > $1.badness }
             return $0.representative.pid < $1.representative.pid
         }
+        var hasSelectedActionableGroup = false
         let plans = groups.map { group in
-            if let reason = policy.reason(for: group.representative, allProcesses: processes) {
+            if let reason = group.members.compactMap({ policy.reason(for: $0, allProcesses: processes) }).first {
                 return ActionPlan(group: group, safety: .protectedTarget, reason: reason)
             }
             switch pressure {
             case .normal, .warn:
                 return ActionPlan(group: group, safety: .reportOnly, reason: "pressure is below termination threshold")
             case .terminate, .kill:
+                guard group.safety != .reportOnly, group.safety != .protectedTarget else {
+                    return ActionPlan(group: group, safety: group.safety, reason: actionReason(group: group, pressure: pressure))
+                }
+                guard !hasSelectedActionableGroup else {
+                    return ActionPlan(
+                        group: group,
+                        safety: .reportOnly,
+                        reason: "\(pressure.rawValue) pressure; deferred to higher-badness candidate for this sample"
+                    )
+                }
+                hasSelectedActionableGroup = true
                 return ActionPlan(group: group, safety: group.safety, reason: actionReason(group: group, pressure: pressure))
             }
         }
@@ -256,17 +268,21 @@ public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
             }
             let startTimes = Dictionary(uniqueKeysWithValues: plan.group.members.map { ($0.pid, $0.startTimeSeconds) })
             let pids = Set(startTimes.keys)
-            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: identity.bundleIdentifier)
-                .filter { pids.contains($0.processIdentifier) }
+            let applications = matchingRunningApplications(for: identity, memberPIDs: pids)
             guard !applications.isEmpty else {
                 return ActionExecutionOutcome(state: .rejected, reason: "sampled application is no longer running")
             }
             var delivered = false
             for application in applications { delivered = application.terminate() || delivered }
             _ = waitGracePeriod(pids: Array(pids), gracePeriodSeconds: gracePeriodSeconds)
+            let aliveSampledMembers = plan.group.members.filter { isPIDAlive($0.pid) }
+            let sampledIdentityIntact = !aliveSampledMembers.isEmpty && aliveSampledMembers.allSatisfy(isSameProcess)
             for application in applications where !application.isTerminated {
-                guard let startTime = startTimes[application.processIdentifier],
-                      isSameProcess(pid: application.processIdentifier, expectedStartTime: startTime) else { continue }
+                if let startTime = startTimes[application.processIdentifier] {
+                    guard isSameProcess(pid: application.processIdentifier, expectedStartTime: startTime) else { continue }
+                } else {
+                    guard sampledIdentityIntact else { continue }
+                }
                 delivered = application.forceTerminate() || delivered
             }
             return executionOutcome(delivered: delivered, reason: "application quit request was not accepted")
@@ -276,8 +292,7 @@ public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
             }
             let startTimes = Dictionary(uniqueKeysWithValues: plan.group.members.map { ($0.pid, $0.startTimeSeconds) })
             let pids = Set(startTimes.keys)
-            let applications = NSRunningApplication.runningApplications(withBundleIdentifier: identity.bundleIdentifier)
-                .filter { pids.contains($0.processIdentifier) }
+            let applications = matchingRunningApplications(for: identity, memberPIDs: pids)
             var delivered = false
             if applications.isEmpty {
                 // A bundle-less/headless helper still gets only its sampled
@@ -306,14 +321,22 @@ public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
                 throw EarlyoomError.cannotReadProcess(groupID, "SIGTERM failed: \(String(cString: strerror(errno)))")
             }
             _ = waitGracePeriod(pids: plan.group.members.map(\.pid), gracePeriodSeconds: gracePeriodSeconds)
-            if signalSender(-groupID, 0) == 0 || errno == EPERM {
-                guard plan.group.members.allSatisfy(isSameProcess) else {
-                    return executionOutcome(delivered: delivered, reason: "sampled process-group identity changed before SIGKILL")
-                }
-                if signalSender(-groupID, SIGKILL) == 0 {
-                    delivered = true
-                } else if errno != ESRCH {
-                    throw EarlyoomError.cannotReadProcess(groupID, "SIGKILL failed: \(String(cString: strerror(errno)))")
+            let aliveMembers = plan.group.members.filter { isPIDAlive($0.pid) }
+            if !aliveMembers.isEmpty && (signalSender(-groupID, 0) == 0 || errno == EPERM) {
+                if aliveMembers.allSatisfy(isSameProcess) {
+                    if signalSender(-groupID, SIGKILL) == 0 {
+                        delivered = true
+                    } else if errno != ESRCH {
+                        throw EarlyoomError.cannotReadProcess(groupID, "SIGKILL failed: \(String(cString: strerror(errno)))")
+                    }
+                } else {
+                    let verifiedAliveMembers = aliveMembers.filter(isSameProcess)
+                    guard !verifiedAliveMembers.isEmpty else {
+                        return executionOutcome(delivered: delivered, reason: "sampled process-group identity changed before SIGKILL")
+                    }
+                    if try signalAll(members: verifiedAliveMembers, signal: SIGKILL) > 0 {
+                        delivered = true
+                    }
                 }
             }
             return executionOutcome(delivered: delivered, reason: "process group disappeared before a signal was delivered")
@@ -324,6 +347,19 @@ public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
 
     private func executionOutcome(delivered: Bool, reason: String) -> ActionExecutionOutcome {
         ActionExecutionOutcome(state: delivered ? .executed : .attempted, reason: delivered ? "signal or application action was delivered" : reason)
+    }
+
+    private func matchingRunningApplications(for identity: ApplicationIdentity, memberPIDs: Set<Int32>) -> [NSRunningApplication] {
+        let expectedPath = URL(fileURLWithPath: identity.applicationPath).standardizedFileURL.path
+        return NSRunningApplication.runningApplications(withBundleIdentifier: identity.bundleIdentifier).filter { app in
+            if memberPIDs.contains(app.processIdentifier) {
+                return true
+            }
+            guard let bundlePath = app.bundleURL?.standardizedFileURL.path else {
+                return false
+            }
+            return bundlePath == expectedPath
+        }
     }
 
     private func signalAll(members: [ProcessSnapshot], signal: Int32) throws -> Int {
@@ -357,16 +393,15 @@ public struct DarwinActionExecutor: ProcessActionExecutor, Sendable {
             if !pids.isEmpty && pids.allSatisfy({ !isPIDAlive($0) }) {
                 return false
             }
-            let chunk = min(gracePollSeconds, remaining)
-            sleeper(chunk)
-            remaining -= chunk
-
             if let memory = try? memorySampler.sample() {
                 let available = memory.physicalBytes == 0 ? 0 : Double(memory.availableBytes) / Double(memory.physicalBytes)
                 if available <= killAvailableFraction {
                     return true
                 }
             }
+            let chunk = min(gracePollSeconds, remaining)
+            sleeper(chunk)
+            remaining -= chunk
         }
         return false
     }

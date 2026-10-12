@@ -54,7 +54,9 @@ public struct SuppressionPolicy: Sendable {
         }
         if protectProcessGroups && process.processGroupID > 0 {
             let protectedMemberExists = allProcesses.contains { member in
-                member.processGroupID == process.processGroupID && member.pid != process.pid && isIntrinsicallyProtected(member)
+                member.processGroupID == process.processGroupID
+                    && member.pid != process.pid
+                    && (isIntrinsicallyProtected(member) || (protectAncestors && isAncestorOrDescendantOfDaemon(member, allProcesses: allProcesses)))
             }
             if protectedMemberExists { return "process group contains a protected session process" }
         }
@@ -76,6 +78,7 @@ public struct SuppressionPolicy: Sendable {
     private func isAncestorOrDescendantOfDaemon(_ process: ProcessSnapshot, allProcesses: [ProcessSnapshot]) -> Bool {
         if process.pid == daemonPID { return true }
         let parentByPID = Dictionary(uniqueKeysWithValues: allProcesses.map { ($0.pid, $0.parentPID) })
+        // Check whether `process` is a descendant of `daemonPID` by walking up from `process.pid`.
         var cursor = process.pid
         var visited = Set<Int32>()
         while cursor > 0, visited.insert(cursor).inserted {
@@ -83,14 +86,13 @@ public struct SuppressionPolicy: Sendable {
             if parent == daemonPID { return true }
             cursor = parent
         }
-        // Also protect children of the daemon.  A process may not be able to
-        // reach the daemon through its current parent after re-parenting.
-        var child = process.parentPID
-        var childVisited = Set<Int32>()
-        while child > 0, childVisited.insert(child).inserted {
-            if child == daemonPID { return true }
-            guard let parent = parentByPID[child] else { break }
-            child = parent
+        // Check whether `process` is an ancestor of `daemonPID` by walking up from `daemonPID`.
+        var ancestorCursor = daemonPID
+        var ancestorVisited = Set<Int32>()
+        while ancestorCursor > 0, ancestorVisited.insert(ancestorCursor).inserted {
+            guard let parent = parentByPID[ancestorCursor] else { break }
+            if parent == process.pid { return true }
+            ancestorCursor = parent
         }
         return false
     }

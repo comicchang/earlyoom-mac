@@ -1,20 +1,6 @@
 import Foundation
 import Darwin
 
-public enum PressureBand: String, Sendable, Equatable {
-    case ok
-    case warn
-    case action
-
-    public init(pressure: PressureLevel) {
-        switch pressure {
-        case .normal: self = .ok
-        case .warn: self = .warn
-        case .terminate, .kill: self = .action
-        }
-    }
-}
-
 public enum ReportCadence: String, Sendable, Equatable {
     case full
     case heartbeat
@@ -79,7 +65,11 @@ public struct EarlyoomDaemon {
         var actionError: Error?
         for plan in actionablePlans {
             do {
-                actionOutcomes.append((plan, try actionExecutor.executeWithOutcome(plan, gracePeriodSeconds: config.gracePeriodSeconds)))
+                let outcome = try actionExecutor.executeWithOutcome(plan, gracePeriodSeconds: config.gracePeriodSeconds)
+                actionOutcomes.append((plan, outcome))
+                if outcome.state == .executed {
+                    break
+                }
             } catch {
                 actionOutcomes.append((plan, ActionExecutionOutcome(state: .rejected, reason: "executor error: \(error)")))
                 actionError = error
@@ -99,23 +89,17 @@ public struct EarlyoomDaemon {
         )
     }
 
+    /// Single-shot convenience entry point; delegates to `run(repeatCount: 1, stopOnSamplingError: true)`.
     @discardableResult
     public func runOnce() throws -> PlanningResult {
-        try enforceLock?.acquire()
-        defer { enforceLock?.release() }
-        let iteration = try executeIteration()
-        output(Self.formatReport(
-            memory: iteration.memory,
-            result: iteration.planningResult,
-            enabled: config.enabled,
-            reportOnly: config.reportOnly,
-            actionOutcomes: iteration.actionOutcomes
-        ))
-        if let actionError = iteration.actionError { throw actionError }
-        return iteration.planningResult
+        guard let result = try run(repeatCount: 1, stopOnSamplingError: true) else {
+            preconditionFailure("run(repeatCount: 1, stopOnSamplingError: true) must produce a PlanningResult or throw")
+        }
+        return result
     }
 
-    public func run(repeatCount: Int? = nil, stopOnSamplingError: Bool? = nil) throws {
+    @discardableResult
+    public func run(repeatCount: Int? = nil, stopOnSamplingError: Bool? = nil) throws -> PlanningResult? {
         try enforceLock?.acquire()
         defer { enforceLock?.release() }
 
@@ -123,7 +107,8 @@ public struct EarlyoomDaemon {
         let isOnce = (repeatCount == 1)
         let shouldStopOnError = stopOnSamplingError ?? isOnce
         var lastOutputTime: Date? = nil
-        var lastPressureBand: PressureBand? = nil
+        var lastPressure: PressureLevel? = nil
+        var lastPlanningResult: PlanningResult? = nil
         var cumulativeActions = 0
 
         while repeatCount == nil || iterations < repeatCount! {
@@ -147,15 +132,15 @@ public struct EarlyoomDaemon {
             cumulativeActions += deliveredCount
             let hasActionOutcomes = !iteration.actionOutcomes.isEmpty
 
-            let currentBand = PressureBand(pressure: iteration.planningResult.pressure)
+            let currentPressure = iteration.planningResult.pressure
             let isFirstRun = (lastOutputTime == nil)
             let now = clock()
             let elapsed = lastOutputTime.map { now.timeIntervalSince($0) } ?? 0
 
             let cadence = Self.determineReportCadence(
                 isFirstRun: isFirstRun,
-                previousBand: lastPressureBand,
-                currentBand: currentBand,
+                previousPressure: lastPressure,
+                currentPressure: currentPressure,
                 hasActionOutcomes: hasActionOutcomes,
                 elapsedSinceLastOutput: elapsed,
                 heartbeatSeconds: config.heartbeatSeconds,
@@ -185,11 +170,15 @@ public struct EarlyoomDaemon {
                 break
             }
 
-            lastPressureBand = currentBand
+            lastPressure = currentPressure
+            lastPlanningResult = iteration.planningResult
             iterations += 1
 
             if let actionError = iteration.actionError {
-                throw actionError
+                if shouldStopOnError {
+                    throw actionError
+                }
+                errorOutput("[error] action execution failed: \(actionError)")
             }
 
             if repeatCount == nil || iterations < repeatCount! {
@@ -197,18 +186,25 @@ public struct EarlyoomDaemon {
                 sleeper(sleepDuration)
             }
         }
+
+        return lastPlanningResult
     }
 
+    /// Determines whether the current iteration should emit a full report, a
+    /// single-line heartbeat, or remain silent.
+    ///
+    /// Configuration parsing requires `heartbeatSeconds > 0`; a non-positive
+    /// value passed programmatically disables periodic heartbeat emission.
     public static func determineReportCadence(
         isFirstRun: Bool,
-        previousBand: PressureBand?,
-        currentBand: PressureBand,
+        previousPressure: PressureLevel?,
+        currentPressure: PressureLevel,
         hasActionOutcomes: Bool,
         elapsedSinceLastOutput: Double,
         heartbeatSeconds: Double,
         isOnce: Bool = false
     ) -> ReportCadence {
-        if isOnce || isFirstRun || previousBand != currentBand || hasActionOutcomes {
+        if isOnce || isFirstRun || previousPressure != currentPressure || hasActionOutcomes {
             return .full
         }
         if heartbeatSeconds > 0 && elapsedSinceLastOutput >= heartbeatSeconds {

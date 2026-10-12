@@ -41,7 +41,7 @@ public final class EnforceLock: @unchecked Sendable {
             throw EarlyoomError.cannotAcquireLock("cannot create lock directory \(directory.path): \(error)")
         }
 
-        let fd = open(url.path, O_RDWR | O_CREAT, 0o600)
+        let fd = open(url.path, O_RDWR | O_CREAT | O_CLOEXEC, 0o600)
         guard fd >= 0 else {
             throw EarlyoomError.cannotAcquireLock("cannot open lock file \(url.path): \(String(cString: strerror(errno)))")
         }
